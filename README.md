@@ -23,9 +23,6 @@ Switch between Dark and Light modes with a single button click.
 5. Console View
 Logging output displayed on Project tab for debugging.
 ---
-Installation
-pip install customtkinter xlrd openpyxl odfpy natsort pillow
-python src/app.py
 Original Project
 https://github.com/marmidr/boomer
 ---
