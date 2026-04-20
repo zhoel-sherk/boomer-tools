@@ -1,4 +1,4 @@
-# BOM and PnP verifier
+# BOM and PnP verifier + tools (Readme WIP)
 
 The purpose of this project is to help an electronic manufacturer in preparation of the new [PCB](Printed Circuit Board) elements.
 
