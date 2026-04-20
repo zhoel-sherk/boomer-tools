@@ -29,6 +29,7 @@ class Profile:
         self.pnp_footprint_col = "?"
         self.pnp_coord_x_col = "?"
         self.pnp_coord_y_col = "?"
+        self.pnp_rotation_col = "?"
         self.pnp_layer_col = "?"
         self.pnp_coord_unit_mils = True
         #
@@ -61,6 +62,7 @@ class Profile:
                 self.pnp_footprint_col = section.get("pnp_footprint_col", "?")
                 self.pnp_coord_x_col = section.get("pnp_coord_x_col", "?")
                 self.pnp_coord_y_col = section.get("pnp_coord_y_col", "?")
+                self.pnp_rotation_col = section.get("pnp_rotation_col", "?")
                 self.pnp_layer_col = section.get("pnp_layer_col", "?")
                 self.pnp_coord_unit_mils = section.get("pnp_coord_unit_mils", "True") == "True"
 
@@ -70,6 +72,7 @@ class Profile:
                     self.pnp_footprint_col = int(self.pnp_footprint_col)
                     self.pnp_coord_x_col = int(self.pnp_coord_x_col)
                     self.pnp_coord_y_col = int(self.pnp_coord_y_col)
+                    self.pnp_rotation_col = int(self.pnp_rotation_col) if self.pnp_rotation_col != "?" else "?"
                     self.pnp_layer_col = int(self.pnp_layer_col)
             else:
                 logger.warning(f"No section {self.name} in config file")
@@ -93,6 +96,7 @@ class Profile:
             "pnp_footprint_col": self.pnp_footprint_col,
             "pnp_coord_x_col": self.pnp_coord_x_col,
             "pnp_coord_y_col": self.pnp_coord_y_col,
+            "pnp_rotation_col": self.pnp_rotation_col,
             "pnp_coord_unit_mils": self.pnp_coord_unit_mils,
             "pnp_layer_col": self.pnp_layer_col,
         }
@@ -184,6 +188,8 @@ class Project:
         self.pnp_grid: text_grid.TextGrid = None
         self.pnp_grid_dirty = False
         self.loading = False
+        # PnP columns
+        self.pnp_layer_col = "?"
 
         # https://docs.python.org/3/library/configparser.html
         self.__config = configparser.ConfigParser()

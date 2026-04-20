@@ -22,6 +22,7 @@ import ods_reader
 import text_grid
 import cross_check
 import report_generator
+import clean_component
 from column_selector import ColumnsSelector, ColumnsSelectorResult
 from project import *
 from msg_box import MessageBox
@@ -184,6 +185,20 @@ class ProjectFrame(customtkinter.CTkFrame):
                                                         variable=self.config_logs.colorlogs_var,
                                                         checkbox_width=18, checkbox_height=18)
         self.config_logs.chx_color_logs.grid(row=1, column=0, pady=5, padx=5, sticky="w")
+
+        # Terminal/Console view
+        lbl_console = customtkinter.CTkLabel(self, text="Console Output:", font=("Arial", 12, "bold"))
+        lbl_console.grid(row=5, column=0, pady=5, padx=5, sticky="w")
+        
+        self.console_textbox = customtkinter.CTkTextbox(self,
+                                                       font=customtkinter.CTkFont(size=10, family="Consolas"),
+                                                       activate_scrollbars=True,
+                                                       wrap='none')
+        self.console_textbox.grid(row=6, column=0, columnspan=6, padx=10, pady=5, sticky="nsew")
+        self.console_textbox.configure(state=tkinter.DISABLED)  # Read-only
+        
+        # Make the console expand
+        self.grid_rowconfigure(6, weight=1)
 
     def clear_previews(self):
         self.opt_pnp_var.set("")
@@ -766,6 +781,7 @@ class PnPConfig(customtkinter.CTkFrame):
                                     footprint_default=proj.profile.pnp_footprint_col,
                                     coord_x_default=proj.profile.pnp_coord_x_col,
                                     coord_y_default=proj.profile.pnp_coord_y_col,
+                                    rotation_default=proj.profile.pnp_rotation_col,
                                     layer_default=proj.profile.pnp_layer_col,
                                     coord_mils_default=proj.profile.pnp_coord_unit_mils,
                                 )
@@ -774,13 +790,14 @@ class PnPConfig(customtkinter.CTkFrame):
     def column_selector_callback(self, result: ColumnsSelectorResult):
         logger.info("Selected PnP columns: "\
                     f"dsgn='{result.designator_col}', cmnt='{result.comment_col}', "\
-                    f"x='{result.coord_x_col}', y='{result.coord_y_col}', lr='{result.layer_col}'")
+                    f"x='{result.coord_x_col}', y='{result.coord_y_col}', rot='{result.rotation_col}', lr='{result.layer_col}'")
         proj.profile.pnp_has_column_headers = result.has_column_headers
         proj.profile.pnp_designator_col = result.designator_col
         proj.profile.pnp_comment_col = result.comment_col
         proj.profile.pnp_footprint_col = result.footprint_col
         proj.profile.pnp_coord_x_col = result.coord_x_col
         proj.profile.pnp_coord_y_col = result.coord_y_col
+        proj.profile.pnp_rotation_col = result.rotation_col
         proj.profile.pnp_coord_unit_mils = result.coord_unit_mils
         proj.profile.pnp_layer_col = result.layer_col
         self.update_lbl_columns()
@@ -965,6 +982,420 @@ class ReportView(customtkinter.CTkFrame):
 
 # -----------------------------------------------------------------------------
 
+class CleanPreview(customtkinter.CTkFrame):
+    def __init__(self, master, **kwargs):
+        self.app = kwargs.pop("app")
+        self.bom_view = kwargs.pop("bom_view", None)
+
+        super().__init__(master, width=700, height=500)
+
+        # Get proj lazily
+        self._proj = None
+        self.comments = []
+
+        # Tkinter variables
+        self.var_res_tolerance = tkinter.BooleanVar(value=True)
+        self.var_res_package = tkinter.BooleanVar(value=True)
+        self.var_cap_voltage = tkinter.BooleanVar(value=True)
+        self.var_cap_dielectric = tkinter.BooleanVar(value=True)
+
+        # Settings section - horizontal layout using pack
+        lbl_settings = customtkinter.CTkLabel(self, text="Clean Settings:", font=("Arial", 14, "bold"))
+        lbl_settings.pack(pady=5)
+
+        # Frames for settings - horizontal pack
+        settings_container = customtkinter.CTkFrame(self)
+        settings_container.pack(fill='x', padx=10)
+
+        frame_res = customtkinter.CTkFrame(settings_container)
+        frame_res.pack(side='left', fill='both', expand=True, padx=5)
+        customtkinter.CTkLabel(frame_res, text="Resistor").pack(pady=2)
+        self.chk_res_tolerance = customtkinter.CTkCheckBox(frame_res, text="Include tolerance", variable=self.var_res_tolerance)
+        self.chk_res_tolerance.pack(pady=2,anchor='w',padx=5)
+        self.chk_res_package = customtkinter.CTkCheckBox(frame_res, text="Include package", variable=self.var_res_package)
+        self.chk_res_package.pack(pady=2,anchor='w',padx=5)
+        self.entry_res_regex = customtkinter.CTkEntry(frame_res, placeholder_text="Custom regex")
+        self.entry_res_regex.pack(pady=2,padx=5)
+
+        frame_cap = customtkinter.CTkFrame(settings_container)
+        frame_cap.pack(side='left', fill='both', expand=True, padx=5)
+        customtkinter.CTkLabel(frame_cap, text="Capacitor").pack(pady=2)
+        self.chk_cap_voltage = customtkinter.CTkCheckBox(frame_cap, text="Include voltage", variable=self.var_cap_voltage)
+        self.chk_cap_voltage.pack(pady=2,anchor='w',padx=5)
+        self.chk_cap_dielectric = customtkinter.CTkCheckBox(frame_cap, text="Include dielectric", variable=self.var_cap_dielectric)
+        self.chk_cap_dielectric.pack(pady=2,anchor='w',padx=5)
+        self.entry_cap_regex = customtkinter.CTkEntry(frame_cap, placeholder_text="Custom regex")
+        self.entry_cap_regex.pack(pady=2,padx=5)
+
+        frame_other = customtkinter.CTkFrame(settings_container)
+        frame_other.pack(side='left', fill='both', expand=True, padx=5)
+        customtkinter.CTkLabel(frame_other, text="Other").pack(pady=2)
+        self.entry_other_regex = customtkinter.CTkEntry(frame_other, placeholder_text="Custom regex")
+        self.entry_other_regex.pack(pady=2,padx=5)
+
+        # Buttons - horizontal
+        btn_container = customtkinter.CTkFrame(self)
+        btn_container.pack(fill='x', padx=10, pady=5)
+
+        self.btn_import = customtkinter.CTkButton(btn_container, text="Import Comment Column", command=self.button_import_event)
+        self.btn_import.pack(side='left', padx=5)
+
+        self.btn_preview = customtkinter.CTkButton(btn_container, text="Preview Clean", command=self.button_preview_event, state=tkinter.DISABLED)
+        self.btn_preview.pack(side='left', padx=5)
+
+        self.btn_apply = customtkinter.CTkButton(btn_container, text="Apply to BOM", command=self.button_apply_event, state=tkinter.DISABLED)
+        self.btn_apply.pack(side='left', padx=5)
+
+        # Preview textbox - fill remaining space
+        text_container = customtkinter.CTkFrame(self)
+        text_container.pack(fill='both', expand=True, padx=10, pady=5)
+
+        self.textbox_preview = customtkinter.CTkTextbox(text_container,
+                                                       font=customtkinter.CTkFont(size=11, family="Consolas"),
+                                                       activate_scrollbars=True,
+                                                       wrap='none')
+        self.textbox_preview.pack(fill='both', expand=True)
+
+    def _get_proj(self):
+        if self._proj is None:
+            self._proj = proj
+        return self._proj
+
+    def button_import_event(self):
+        proj = self._get_proj()
+        if proj.bom_grid is None:
+            logger.error("No BOM loaded")
+            return
+
+        comment_col = proj.profile.bom_comment_col
+        comment_col_idx = -1
+        if isinstance(comment_col, int):
+            comment_col_idx = comment_col
+        elif isinstance(comment_col, str) and comment_col != "?":
+            header_row = proj.bom_grid.rows_raw()[proj.profile.bom_first_row]
+            for i, h in enumerate(header_row):
+                if h.strip() == comment_col.strip():
+                    comment_col_idx = i
+                    break
+
+        if comment_col_idx < 0:
+            logger.error("BOM comment column not configured")
+            return
+
+        self.comments = []
+        for row in proj.bom_grid.rows_raw()[proj.profile.bom_first_row:]:
+            if comment_col_idx < len(row):
+                self.comments.append(str(row[comment_col_idx]))
+
+        self.textbox_preview.delete("0.0", tkinter.END)
+        self.textbox_preview.insert("0.0", "Imported " + str(len(self.comments)) + " comments. Click 'Preview Clean' to process.\n")
+        self.textbox_preview.insert(tkinter.END, "=" * 60 + "\n")
+        for i, c in enumerate(self.comments):
+            display = c[:58] + ".." if len(c) > 60 else c
+            self.textbox_preview.insert(tkinter.END, f"{i+1}: {display}\n")
+
+        self.btn_preview.configure(state=tkinter.NORMAL)
+        self.btn_apply.configure(state=tkinter.DISABLED)
+        logger.info(f"Imported {len(self.comments)} comments")
+
+    def button_preview_event(self):
+        if not self.comments:
+            logger.error("No comments imported")
+            return
+
+        logger.info(f"Generating clean preview for {len(self.comments)} components...")
+        results = clean_component.clean_preview(self.comments)
+
+        # Display results
+        self.textbox_preview.delete("0.0", tkinter.END)
+        self.textbox_preview.insert("0.0", f"{'#':<5} {'Original':<35} {'Cleaned':<35} {'Type':<10}\n")
+        self.textbox_preview.insert(tkinter.END, "=" * 90 + "\n")
+
+        for idx, original, cleaned, ctype in results:
+            orig_display = original[:33] + ".." if len(original) > 35 else original
+            clean_display = cleaned[:33] + ".." if len(cleaned) > 35 else cleaned
+            self.textbox_preview.insert(tkinter.END, f"{idx:<5} {orig_display:<35} {clean_display:<35} {ctype:<10}\n")
+
+        self.btn_apply.configure(state=tkinter.NORMAL)
+        logger.info(f"Clean preview generated: {len(results)} rows")
+
+    def button_apply_event(self):
+        proj = self._get_proj()
+
+        comment_col = proj.profile.bom_comment_col
+        comment_col_idx = -1
+        if isinstance(comment_col, int):
+            comment_col_idx = comment_col
+        elif isinstance(comment_col, str) and comment_col != "?":
+            # Convert column name to index
+            header_row = proj.bom_grid.rows_raw()[proj.profile.bom_first_row]
+            for i, h in enumerate(header_row):
+                if h.strip() == comment_col.strip():
+                    comment_col_idx = i
+                    break
+        
+        if comment_col_idx < 0:
+            logger.error("BOM comment column not configured")
+            return
+
+        # Get all comments
+        rows = proj.bom_grid.rows_raw()
+        count = 0
+        for i, row in enumerate(rows[proj.profile.bom_first_row:], start=proj.profile.bom_first_row):
+            if comment_col_idx < len(row):
+                original = str(row[comment_col_idx])
+                cleaned = clean_component.clean_component("RES", original)
+                if cleaned == original:
+                    cleaned = clean_component.clean_component("CAP", original)
+                if cleaned == original:
+                    cleaned = clean_component.clean_component("OTHER", original)
+                row[comment_col_idx] = cleaned
+                count += 1
+
+        proj.bom_grid_dirty = True
+        proj.profile.save()
+
+        # Refresh BOM view
+        bom_txt_grid = proj.bom_grid.format_grid(proj.profile.bom_first_row, proj.profile.bom_last_row)
+        self.bom_view.textbox.delete("0.0", tkinter.END)
+        self.bom_view.textbox.insert("0.0", bom_txt_grid)
+
+        logger.info(f"Applied clean to {count} BOM components")
+
+# -----------------------------------------------------------------------------
+
+class MergeView(customtkinter.CTkFrame):
+    def __init__(self, master, **kwargs):
+        assert "app" in kwargs
+        self.app = kwargs.pop("app")
+        assert "bom_view" in kwargs
+        self.bom_view = kwargs.pop("bom_view")
+        assert "pnp_view" in kwargs
+        self.pnp_view = kwargs.pop("pnp_view")
+
+        super().__init__(master, **kwargs)
+
+        # Info section - using profile settings
+        lbl_info = customtkinter.CTkLabel(self, text="Merge uses column settings from BOM and PnP tabs", font=("Arial", 12))
+        lbl_info.grid(row=0, column=0, columnspan=3, pady=5, padx=5, sticky="w")
+
+        # Options
+        frame_opts = customtkinter.CTkFrame(self)
+        frame_opts.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky="w")
+        
+        self.chk_delete_dnp = customtkinter.CTkCheckBox(frame_opts, text="Delete DNP components")
+        self.chk_delete_dnp.grid(row=0, column=0, padx=5, sticky="w")
+
+        # Buttons
+        frame_btns = customtkinter.CTkFrame(self)
+        frame_btns.grid(row=2, column=0, columnspan=3, pady=5, sticky="ew")
+        
+        self.btn_merge = customtkinter.CTkButton(frame_btns, text="Merge", command=self.button_merge_event)
+        self.btn_merge.grid(row=0, column=0, padx=5, pady=5)
+        
+        self.btn_save_csv = customtkinter.CTkButton(frame_btns, text="Save CSV", command=self.button_save_csv_event)
+        self.btn_save_csv.grid(row=0, column=1, padx=5, pady=5)
+        self.btn_save_csv.configure(state=tkinter.DISABLED)
+        
+        self.btn_save_excel = customtkinter.CTkButton(frame_btns, text="Save Excel", command=self.button_save_excel_event)
+        self.btn_save_excel.grid(row=0, column=2, padx=5, pady=5)
+        self.btn_save_excel.configure(state=tkinter.DISABLED)
+
+        # Result textbox
+        self.textbox = customtkinter.CTkTextbox(self,
+                                               font=customtkinter.CTkFont(size=11, family="Consolas"),
+                                               activate_scrollbars=True,
+                                               wrap='none')
+        self.textbox.grid(row=3, column=0, columnspan=3, padx=10, pady=10, sticky="nsew")
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+        
+        self.merge_result = None
+
+    def button_merge_event(self):
+        if proj.bom_grid is None or proj.pnp_grid is None:
+            logger.error("Please load both BOM and PnP files")
+            return
+
+        # Use profile settings for columns
+        try:
+            # Helper: resolve column name to index
+            def get_col_idx(header_row, col_name):
+                if col_name == "?" or col_name == "":
+                    return -1
+                if isinstance(col_name, int):
+                    return col_name
+                # col_name is a string (column header), find its index
+                try:
+                    return int(col_name)
+                except (ValueError, TypeError):
+                    # Search for column by header name
+                    for i, header in enumerate(header_row):
+                        if header.strip() == col_name.strip():
+                            return i
+                    return -1
+
+            bom_ref_col = get_col_idx(proj.bom_grid.rows_raw()[proj.profile.bom_first_row], proj.profile.bom_designator_col)
+            bom_name_col = get_col_idx(proj.bom_grid.rows_raw()[proj.profile.bom_first_row], proj.profile.bom_comment_col)
+
+            pnp_ref_col = get_col_idx(proj.pnp_grid.rows_raw()[proj.profile.pnp_first_row], proj.profile.pnp_designator_col)
+            pnp_x_col = get_col_idx(proj.pnp_grid.rows_raw()[proj.profile.pnp_first_row], proj.profile.pnp_coord_x_col)
+            pnp_y_col = get_col_idx(proj.pnp_grid.rows_raw()[proj.profile.pnp_first_row], proj.profile.pnp_coord_y_col)
+            pnp_rot_col = get_col_idx(proj.pnp_grid.rows_raw()[proj.profile.pnp_first_row], proj.profile.pnp_rotation_col)
+            pnp_layer_col = get_col_idx(proj.pnp_grid.rows_raw()[proj.profile.pnp_first_row], proj.profile.pnp_layer_col)
+            pnp_footprint_col = get_col_idx(proj.pnp_grid.rows_raw()[proj.profile.pnp_first_row], proj.profile.pnp_footprint_col)
+            pnp_comment_col = get_col_idx(proj.pnp_grid.rows_raw()[proj.profile.pnp_first_row], proj.profile.pnp_comment_col)
+            
+            coord_unit_mils = proj.profile.pnp_coord_unit_mils
+            delete_dnp = self.chk_delete_dnp.get() == 1
+            
+            logger.debug(f"Merge columns: bom_ref={bom_ref_col}, bom_name={bom_name_col}, pnp_ref={pnp_ref_col}")
+        except Exception as e:
+            logger.error(f"Profile columns not configured: {e}")
+            return
+
+        # Build BOM parts dict
+        bom_parts = {}
+        for row in proj.bom_grid.rows_raw()[proj.profile.bom_first_row:]:
+            if bom_ref_col >= 0 and bom_ref_col < len(row):
+                ref = str(row[bom_ref_col]).strip()
+                if ref:
+                    name = str(row[bom_name_col]).strip() if bom_name_col >= 0 and bom_name_col < len(row) else ""
+                    bom_parts[ref] = name
+        
+        logger.debug(f"BOM parts dict has {len(bom_parts)} entries: {list(bom_parts.items())[:5]}")
+
+        # Merge PnP with BOM
+        self.merge_result = []
+        coord_mult = 25.4 if coord_unit_mils else 1.0
+        pnp_start = proj.profile.pnp_first_row + 1  # Skip header row
+
+        for row in proj.pnp_grid.rows_raw()[pnp_start:]:
+            if pnp_ref_col < 0 or pnp_ref_col >= len(row):
+                continue
+            
+            ref = str(row[pnp_ref_col]).strip()
+            if not ref:
+                continue
+            
+            # Get name from BOM
+            name = bom_parts.get(ref, "")
+            if not name:
+                name = str(row[pnp_comment_col]).strip() if pnp_comment_col >= 0 and pnp_comment_col < len(row) else ""
+            if not name:
+                name = "DNP_from_bom" if delete_dnp else ""
+            
+            if delete_dnp and name == "DNP_from_bom":
+                continue
+            
+            if pnp_x_col >= 0 and pnp_x_col < len(row):
+                s = str(row[pnp_x_col]).strip().lower().replace('mil', '').replace('mm', '').strip()
+                try:
+                    x = float(s) * coord_mult
+                except ValueError:
+                    x = 0.0
+            else:
+                x = 0.0
+            
+            if pnp_y_col >= 0 and pnp_y_col < len(row):
+                s = str(row[pnp_y_col]).strip().lower().replace('mil', '').replace('mm', '').strip()
+                try:
+                    y = float(s) * coord_mult
+                except ValueError:
+                    y = 0.0
+            else:
+                y = 0.0
+            rot = str(row[pnp_rot_col]) if pnp_rot_col >= 0 and pnp_rot_col < len(row) else "0"
+            layer = str(row[pnp_layer_col]) if pnp_layer_col >= 0 and pnp_layer_col < len(row) else "Top"
+            footprint = str(row[pnp_footprint_col]) if pnp_footprint_col >= 0 and pnp_footprint_col < len(row) else ""
+            comment = str(row[pnp_comment_col]) if pnp_comment_col >= 0 and pnp_comment_col < len(row) else ""
+            
+            self.merge_result.append({
+                'ref': ref,
+                'name': name,
+                'footprint': footprint,
+                'x': round(x, 3),
+                'y': round(y, 3),
+                'rotation': rot,
+                'layer': layer,
+                'comment': comment
+            })
+
+        # Display results
+        self.textbox.delete("0.0", tkinter.END)
+        header = f"{'ref':<8} {'name':<20} {'footprint':<12} {'x':<10} {'y':<10} {'rot':<6} {'layer':<6}\n"
+        self.textbox.insert("0.0", header)
+        self.textbox.insert(tkinter.END, "=" * 80 + "\n")
+        
+        for item in self.merge_result[:100]:  # Show first 100
+            line = f"{item['ref']:<8} {item['name'][:19]:<20} {item['footprint'][:11]:<12} {item['x']:<10.3f} {item['y']:<10.3f} {item['rotation']:<6} {item['layer']:<6}\n"
+            self.textbox.insert(tkinter.END, line)
+        
+        if len(self.merge_result) > 100:
+            self.textbox.insert(tkinter.END, f"\n... and {len(self.merge_result) - 100} more rows\n")
+        
+        self.btn_save_csv.configure(state=tkinter.NORMAL)
+        self.btn_save_excel.configure(state=tkinter.NORMAL)
+        
+        logger.info(f"Merge complete: {len(self.merge_result)} components")
+
+    def button_save_csv_event(self):
+        if not self.merge_result:
+            return
+        
+        import csv
+        from tkinter import filedialog
+        
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"merged_{os.path.splitext(os.path.basename(proj.bom_path))[0]}.csv"
+        )
+        
+        if filename:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['ref', 'name', 'footprint', 'x', 'y', 'rotation', 'layer', 'comment'])
+                writer.writeheader()
+                writer.writerows(self.merge_result)
+            logger.info(f"Saved CSV: {filename}")
+
+    def button_save_excel_event(self):
+        if not self.merge_result:
+            return
+        
+        try:
+            import openpyxl
+        except ImportError:
+            logger.error("openpyxl not installed. Install with: pip install openpyxl")
+            return
+        
+        from tkinter import filedialog
+        
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            initialfile=f"merged_{os.path.splitext(os.path.basename(proj.bom_path))[0]}.xlsx"
+        )
+        
+        if filename:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Merged"
+            
+            headers = ['ref', 'name', 'footprint', 'x', 'y', 'rotation', 'layer', 'comment']
+            ws.append(headers)
+            
+            for item in self.merge_result:
+                ws.append([item.get(h, '') for h in headers])
+            
+            wb.save(filename)
+            logger.info(f"Saved Excel: {filename}")
+
+# -----------------------------------------------------------------------------
+
 class CtkApp(customtkinter.CTk):
     def __init__(self):
         logger.info('Ctk app is starting')
@@ -980,9 +1411,20 @@ class CtkApp(customtkinter.CTk):
         self.grid_rowconfigure(1, weight=1) # set row 1 height to all remaining space
         tab_prj = tabview.add("Project")
         tab_bom = tabview.add("Bill Of Materials")
+        tab_clean = tabview.add("Clean BOM")
         tab_pnp = tabview.add("Pick And Place")
         tab_report = tabview.add("Cross-check Report")
+        tab_merge = tabview.add("Merge Report")
         tabview.set("Project")  # set currently visible tab
+        
+        # Theme toggle button
+        self.btn_theme = customtkinter.CTkButton(self, text="🌙 Dark", width=80, command=self.toggle_theme)
+        self.btn_theme.grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        
+        # Check system theme and set accordingly
+        system_theme = customtkinter.get_appearance_mode()
+        if system_theme == "Dark":
+            self.btn_theme.configure(text="☀️ Light")
 
         # panel with predefined configs
         proj_frame = ProjectFrame(tab_prj, app=self)
@@ -995,11 +1437,24 @@ class CtkApp(customtkinter.CTk):
         self.bom_view.grid(row=0, column=0, padx=5, pady=5, sticky="wens")
         self.bom_config = BOMConfig(tab_bom, app=self, bom_view=self.bom_view)
         self.bom_config.grid(row=1, column=0, pady=5, padx=5, sticky="we")
+        
         proj_frame.bom_config = self.bom_config
         proj_frame.bom_view = self.bom_view
 
         tab_bom.grid_columnconfigure(0, weight=1)
         tab_bom.grid_rowconfigure(0, weight=1)
+        
+        # Clean BOM tab - uses BOM comment column
+        # Put label outside CleanPreview frame
+        lbl_clean_info = customtkinter.CTkLabel(tab_clean, text="Clean BOM uses column setting from BOM tab - Comment (value)")
+        lbl_clean_info.grid(row=0, column=0, padx=5, pady=(10,2), sticky="w")
+        
+        # CleanPreview widget
+        self.clean_preview = CleanPreview(tab_clean, app=self, bom_view=self.bom_view)
+        self.clean_preview.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        
+        tab_clean.grid_columnconfigure(0, weight=1)
+        tab_clean.grid_rowconfigure(1, weight=1)
 
         # panel with the PnP
         self.pnp_view = PnPView(tab_pnp, app=self)
@@ -1020,8 +1475,26 @@ class CtkApp(customtkinter.CTk):
         tab_report.grid_columnconfigure(0, weight=1)
         tab_report.grid_rowconfigure(0, weight=1)
 
+        # panel with Merge
+        self.merge_view = MergeView(tab_merge, app=self, bom_view=self.bom_view, pnp_view=self.pnp_view)
+        self.merge_view.grid(row=0, column=0, padx=5, pady=5, sticky="wens")
+
+        tab_merge.grid_columnconfigure(0, weight=1)
+        tab_merge.grid_rowconfigure(0, weight=1)
+
         # UI ready
         logger.info('Application ready.')
+
+    def toggle_theme(self):
+        current = customtkinter.get_appearance_mode()
+        if current == "Dark":
+            customtkinter.set_appearance_mode("Light")
+            self.btn_theme.configure(text="🌙 Dark")
+            logger.info("Theme: Light")
+        else:
+            customtkinter.set_appearance_mode("Dark")
+            self.btn_theme.configure(text="☀️ Light")
+            logger.info("Theme: Dark")
 
 # -----------------------------------------------------------------------------
 

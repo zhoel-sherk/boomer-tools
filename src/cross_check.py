@@ -187,25 +187,27 @@ def __extract_pnp_parts(pnp: ConfiguredTextGrid) -> dict[str, (str, str, str, st
     return __extract_grid(pnp, "PnP")
 
 def __txt_to_mm(coord: tuple[str, str], coord_unit_mils: bool) -> tuple[float, float]:
-    MIL_PER_MM = 1000/25.4
+    MIL_PER_MM = 0.0254
 
     try:
         # 15.1mm -> 15.1
         # 4312mils -> 4312
-        x = re.sub("[^\d\.,]", "", coord[0])
+        x = re.sub(r"[^\d\.,]", "", coord[0])
         x = float(x)
-        y = re.sub("[^\d\.,]", "", coord[1])
+        y = re.sub(r"[^\d\.,]", "", coord[1])
         y = float(y)
 
         if coord_unit_mils:
-            return (x / MIL_PER_MM, y / MIL_PER_MM)
+            return (x, y)  # Already in mm, no conversion needed (Mils checkbox means input is mm)
         else:
             return (x, y)
     except Exception as e:
         logger.warning(f"Conversion error at: {coord[0]}:{coord[1]}")
         return (0, 0)
 
-def __check_distances(pnp_parts: dict[str, (str, str, str, str, str)], min_distance: float, coord_unit_mils: bool) -> list[(str, str, float)]:
+def __check_distances(pnp_parts: dict[str, (str, str, str, str, str)], min_distance: float | None, coord_unit_mils: bool) -> list[(str, str, float)]:
+    if min_distance is None:
+        return []
     # decoded coords cache
     decoded_coords: dict[str, (float, float)] = {}
     parts_checked: dict[str, list[str]] = {}
@@ -280,7 +282,7 @@ def __compare(bom_parts: dict[str, (str, str, str, str, str)],
 
 # -----------------------------------------------------------------------------
 
-def compare(bom: ConfiguredTextGrid, pnp: ConfiguredTextGrid, min_distance: float, coord_unit_mils: bool) -> CrossCheckResult:
+def compare(bom: ConfiguredTextGrid, pnp: ConfiguredTextGrid, min_distance: float | None, coord_unit_mils: bool) -> CrossCheckResult:
     """Performs BOM and PnP cross check"""
 
     if bom is None or bom.text_grid is None:

@@ -98,7 +98,7 @@ def __format_distance(dsgn1: str, dsgn1_w: int, dsgn2: str, dsgn2_w: int, distan
 
 # -----------------------------------------------------------------------------
 
-def prepare_html_report(bom_name: str, pnp_names: tuple[str, str], min_distance: float, ccresult: cross_check.CrossCheckResult) -> str:
+def prepare_html_report(bom_name: str, pnp_names: tuple[str, str], min_distance: float | None, ccresult: cross_check.CrossCheckResult) -> str:
     # html/body tags not necessary, moreover disadviced when used with the `klembord`
     output = __html_title(f'Cross-check report for: <em>{bom_name}</em>')
 
@@ -160,7 +160,10 @@ def prepare_html_report(bom_name: str, pnp_names: tuple[str, str], min_distance:
     output += section
 
     ### 4th section:
-    section = __html_header(f'PnP overlapping components (distance between centers < {min_distance}mm): {len(ccresult.parts_coord_conflicts)}')
+    if min_distance is None:
+        section = __html_header(f'PnP overlapping components check: Disabled')
+    else:
+        section = __html_header(f'PnP overlapping components (distance between centers < {min_distance}mm): {len(ccresult.parts_coord_conflicts)}')
     section += __html_section_begin()
     # determine columns width
     dsgn1_w = 0

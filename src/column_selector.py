@@ -13,6 +13,7 @@ class ColumnsSelectorResult:
         self.comment_col = ""
         self.coord_x_col = ""
         self.coord_y_col = ""
+        self.rotation_col = ""
         self.layer_col = ""
         self.footprint_col = ""
         self.coord_unit_mils = True
@@ -57,22 +58,32 @@ class ColumnsSelector(customtkinter.CTkToplevel):
         else:
             footprint_default = ""
 
+# ----------
+        
+        # Rotation column (optional - only for PnP)
+        self.show_rotation = "rotation_default" in kwargs
+        if self.show_rotation:
+            rotation_default = kwargs.pop("rotation_default")
+            rotation_default = self.__format_column(has_column_headers, columns, rotation_default)
+        else:
+            rotation_default = ""
+        self.rotation_default = rotation_default
+        
         # ----------
-
+        
         # optional, only for PnP
-        if "coord_x_default" in kwargs and "coord_y_default" in kwargs and "layer_default" in kwargs:
+        self.show_coords = "coord_x_default" in kwargs and "coord_y_default" in kwargs and "layer_default" in kwargs
+        if self.show_coords:
             coord_x_default = kwargs.pop("coord_x_default")
             coord_x_default = self.__format_column(has_column_headers, columns, coord_x_default)
             coord_y_default = kwargs.pop("coord_y_default")
             coord_y_default = self.__format_column(has_column_headers, columns, coord_y_default)
             layer_default = kwargs.pop("layer_default")
             layer_default = self.__format_column(has_column_headers, columns, layer_default)
-            self.show_coords = True
         else:
             coord_x_default = ""
             coord_y_default = ""
             layer_default = ""
-            self.show_coords = False
 
         if "coord_mils_default" in kwargs:
             coord_unit_idx = kwargs.pop("coord_mils_default")
@@ -83,7 +94,7 @@ class ColumnsSelector(customtkinter.CTkToplevel):
         # ----------
 
         super().__init__(*args, **kwargs)
-        ui_helpers.window_set_centered(app, self, 400, 370)
+        ui_helpers.window_set_centered(app, self, 450, 500)
 
         # prepend column titles with their corresponding index
         columns = [f"{idx+1}. {item}" for (idx,item) in enumerate(columns)]
@@ -152,15 +163,26 @@ class ColumnsSelector(customtkinter.CTkToplevel):
             opt_coord_y.grid(row=5, column=1, pady=5, padx=5, sticky="we")
 
         #
+        if self.show_rotation:
+            lbl_rotation = customtkinter.CTkLabel(self, text="Rotation (for Merge)")
+            lbl_rotation.grid(row=6, column=0, pady=5, padx=5, sticky="w")
+
+            self.opt_rotation_var = customtkinter.StringVar(value=self.rotation_default)
+            opt_rotation = customtkinter.CTkOptionMenu(self, values=columns,
+                                                       command=self.opt_event,
+                                                       variable=self.opt_rotation_var)
+            opt_rotation.grid(row=6, column=1, pady=5, padx=5, sticky="we")
+
+        #
         lbl_unit = customtkinter.CTkLabel(self, text="Coords unit")
-        lbl_unit.grid(row=6, column=0, pady=5, padx=5, sticky="w")
+        lbl_unit.grid(row=7, column=0, pady=5, padx=5, sticky="w")
 
         self.rb_unit_var = tkinter.IntVar(value=coord_unit_idx)
 
         if self.show_coords:
             #
             self.config_unit = customtkinter.CTkFrame(self)
-            self.config_unit.grid(row=6, column=1, pady=5, padx=5, columnspan=1, sticky="we")
+            self.config_unit.grid(row=7, column=1, pady=5, padx=5, columnspan=1, sticky="we")
             #
             self.rb_unit_mils = customtkinter.CTkRadioButton(self.config_unit, text="mils",
                                                         variable=self.rb_unit_var,
@@ -175,28 +197,32 @@ class ColumnsSelector(customtkinter.CTkToplevel):
 
         #
         lbl_layer = customtkinter.CTkLabel(self, text="Layer")
-        lbl_layer.grid(row=7, column=0, pady=5, padx=5, sticky="w")
+        lbl_layer.grid(row=9, column=0, pady=5, padx=5, sticky="w")
 
         self.opt_layer_var = customtkinter.StringVar(value=layer_default)
         if self.show_coords:
             opt_layer = customtkinter.CTkOptionMenu(self, values=columns,
                                                     command=self.opt_event,
                                                     variable=self.opt_layer_var)
-            opt_layer.grid(row=7, column=1, pady=5, padx=5, sticky="we")
+            opt_layer.grid(row=9, column=1, pady=5, padx=5, sticky="we")
 
-        #
+#
         sep_h = tkinter.ttk.Separator(self, orient='horizontal')
-        sep_h.grid(row=8, column=0, columnspan=2, pady=5, padx=5, sticky="we",)
+        sep_h.grid(row=10, column=0, columnspan=2, pady=5, padx=5, sticky="we",)
 
         self.btn_cancel = customtkinter.CTkButton(self, text="Cancel",
                                                    command=self.button_cancel_event)
         #
-        self.btn_cancel.grid(row=9, column=0, pady=5, padx=5, sticky="")
+        self.btn_cancel.grid(row=11, column=0, pady=10, padx=5, sticky="")
 
         self.btn_ok = customtkinter.CTkButton(self, text="OK",
-                                                command=self.button_ok_event)
-        self.btn_ok.grid(row=9, column=1, pady=5, padx=5, sticky="we")
+                                                  command=self.button_ok_event)
+        self.btn_ok.grid(row=11, column=1, pady=10, padx=5, sticky="we")
         self.btn_ok.configure(state=tkinter.DISABLED)
+
+        # Initialize rotation var if not shown (for BOM selector)
+        if not self.show_rotation:
+            self.opt_rotation_var = customtkinter.StringVar(value="")
 
         # enable "always-on-top" for this popup window
         self.attributes('-topmost', True)
@@ -234,35 +260,40 @@ class ColumnsSelector(customtkinter.CTkToplevel):
 
     def button_ok_event(self):
         result = ColumnsSelectorResult()
+
         result.has_column_headers = self.chbx_columnheaders_var.get()
         result.designator_col = self.opt_designator_var.get()
         result.comment_col = self.opt_comment_var.get()
         result.coord_x_col = self.opt_coord_x_var.get()
         result.coord_y_col = self.opt_coord_y_var.get()
+        result.rotation_col = self.opt_rotation_var.get()
         result.coord_unit_mils = self.rb_unit_var.get() == 0
         result.layer_col = self.opt_layer_var.get()
         result.footprint_col = self.opt_footprint_var.get()
 
         if result.has_column_headers:
-            # extract column name
             result.designator_col = result.designator_col.split(sep=". ")[1]
             result.comment_col = result.comment_col.split(sep=". ")[1]
             if (result.footprint_col):
                 result.footprint_col = result.footprint_col.split(sep=". ")[1]
-
+            if (result.rotation_col):
+                result.rotation_col = result.rotation_col.split(sep=". ")[1]
             if self.show_coords:
                 result.coord_x_col = result.coord_x_col.split(sep=". ")[1]
                 result.coord_y_col = result.coord_y_col.split(sep=". ")[1]
                 result.layer_col = result.layer_col.split(sep=". ")[1]
         else:
-            # extract column index
+            # numeric index (0-based)
             result.designator_col = int(result.designator_col.split(sep=". ")[0])
             result.designator_col -= 1
             result.comment_col = int(result.comment_col.split(sep=". ")[0])
             result.comment_col -= 1
-            if (result.footprint_col):
+            if result.footprint_col:
                 result.footprint_col = int(result.footprint_col.split(sep=". ")[0])
                 result.footprint_col -= 1
+            if result.rotation_col:
+                result.rotation_col = int(result.rotation_col.split(sep=". ")[0])
+                result.rotation_col -= 1
             if self.show_coords:
                 result.coord_x_col = int(result.coord_x_col.split(sep=". ")[0])
                 result.coord_x_col -= 1
