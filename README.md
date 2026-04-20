@@ -1,5 +1,35 @@
 # BOM and PnP verifier + tools (Readme WIP)
 
+---
+Boomer Tools - Enhanced BOM vs PnP Cross Checker
+New Features Added
+1. Clean BOM Tab
+Smart component value cleaning with intelligent classification:
+- Resistors: Extracts package, value, and tolerance (e.g., 100R+1/16W+±5%+0402 → 0402_100R)
+- Capacitors: Extracts package, value, voltage, dielectric, tolerance (e.g., 10UF+16V+±10%(K)+0402+X5R → 0402_10UF_16V_X5R_10%(K))
+- Inductors: Extracts package, value, current rating (e.g., 2.2uH+±30%+1.6+3015 → 3015_2.2UH)
+- Smart detection via priority markers (wattage for resistors, uF/nF/pF for capacitors, uH/nH for inductors)
+2. Merge Report Tab
+Merges BOM and Pick-and-Place data with:
+- Configurable column mapping from profile
+- Support for coordinate units (mils/mm)
+- Export to CSV and Excel formats
+3. Theme Toggle
+Switch between Dark and Light modes with a single button click.
+4. Column Selector Fixes
+- Rotation column now properly shows in PnP column selector
+- Fixed column name-to-index resolution
+- Improved coordinate parsing (supports "mil" and "mm" suffixes)
+5. Console View
+Logging output displayed on Project tab for debugging.
+---
+Installation
+pip install customtkinter xlrd openpyxl odfpy natsort pillow
+python src/app.py
+Original Project
+https://github.com/marmidr/boomer
+---
+
 The purpose of this project is to help an electronic manufacturer in preparation of the new [PCB](Printed Circuit Board) elements.
 
 It reads the [BOM](Bill Of Materials) and the accompanying [PnP](Pick And Place) files, performing cross-checking to ensure if those files contents matches.
