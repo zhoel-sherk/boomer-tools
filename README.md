@@ -1,4 +1,4 @@
-# Boomer Tools
+# Boomer Tools (WIP)
 
 Boomer Tools is an active fork of the original Boomer BOM/PnP comparator.
 
