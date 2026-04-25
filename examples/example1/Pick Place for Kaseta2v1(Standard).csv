@@ -112,8 +112,8 @@ R55        REZ_MIFON_1206        1888mil        114mil       1888mil        114m
 R56        REZ_MIFON_1206        2244mil        118mil       2244mil        118mil       2244mil         58mil  B        270.00 1k5            
 C42        CAP_MIFON_1206    1077.992mil   1100.347mil   1077.992mil   1100.347mil   1137.992mil   1100.347mil  B        360.00 100n           
 C41        CAP_MIFON_1206    1407.992mil    845.346mil   1407.992mil    845.346mil   1407.992mil    785.346mil  B        270.00 100n           
-C40        CAP_MIFON_1206    1747.992mil   2630.347mil   1747.992mil   2630.347mil   1687.992mil   2630.347mil  B        180.00 100n           
-C39        CAP_MIFON_1206    1087.992mil       2414mil   1087.992mil       2414mil   1147.992mil       2414mil  B        360.00 100n           
+C40        CAP_MIFON_1206    1747.992mil   2630.347mil   1747.992mil   2630.347mil   1147.992mil   2630.347mil  B        180.00 100n           
+C39        CAP_MIFON_1206    1747.992mil   2630.347mil   1747.992mil   2630.347mil   1147.992mil   2630.347mil  B        360.00 100n           
 R61        REZ_MIFON_1206        1030mil       2070mil       1030mil       2070mil        970mil       2070mil  B        180.00 10k            
 Q8         INF-SOT23_M           2045mil       2815mil       2045mil       2815mil   1997.756mil   2777.598mil  B        360.00 MMBT2222A      
 R52        REZ_MIFON_1206        1570mil       3000mil       1570mil       3000mil       1570mil       2940mil  B        270.00 10k            

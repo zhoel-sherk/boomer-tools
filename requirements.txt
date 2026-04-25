@@ -1,0 +1,13 @@
+# Runtime dependencies for the PySide6 desktop app
+PySide6
+qt-material
+pandas
+numpy
+xlrd
+openpyxl
+odfpy
+natsort
+
+# Test / developer tooling
+pytest
+coverage

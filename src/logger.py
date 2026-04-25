@@ -4,7 +4,17 @@ import time
 
 # -----------------------------------------------------------------------------
 
-# __logger = None
+# Create a default logger if not initialized
+try:
+    __logger = logging.getLogger('__logger')
+    __logger.setLevel(logging.DEBUG)
+    # Add default handler if none exists
+    if not __logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.DEBUG)
+        __logger.addHandler(handler)
+except:
+    __logger = None
 
 # -----------------------------------------------------------------------------
 
@@ -81,56 +91,36 @@ def config(use_color_logs: bool):
 # -----------------------------------------------------------------------------
 
 def debug(msg, *args, **kwargs):
-    """
-    Log 'msg % args' with severity 'DEBUG'.
-
-    To pass exception information, use the keyword argument exc_info with
-    a true value, e.g.
-
-    logger.debug("Houston, we have a %s", "thorny problem", exc_info=1)
-    """
+    """Log 'msg % args' with severity 'DEBUG'."""
+    if __logger is None:
+        return
     if __logger.isEnabledFor(logging.DEBUG):
         __logger._log(logging.DEBUG, msg, args, **kwargs)
 
 def info(msg, *args, **kwargs):
-    """
-    Log 'msg % args' with severity 'INFO'.
-
-    To pass exception information, use the keyword argument exc_info with
-    a true value, e.g.
-
-    logger.info("Houston, we have a %s", "interesting problem", exc_info=1)
-    """
+    """Log 'msg % args' with severity 'INFO'."""
+    if __logger is None:
+        return
     if __logger.isEnabledFor(logging.INFO):
         __logger._log(logging.INFO, msg, args, **kwargs)
 
 def warning(msg, *args, **kwargs):
-    """
-    Log 'msg % args' with severity 'WARNING'.
-
-    To pass exception information, use the keyword argument exc_info with
-    a true value, e.g.
-
-    logger.warning("Houston, we have a %s", "bit of a problem", exc_info=1)
-    """
+    """Log 'msg % args' with severity 'WARNING'."""
+    if __logger is None:
+        return
     if __logger.isEnabledFor(logging.WARNING):
         __logger._log(logging.WARNING, msg, args, **kwargs)
 
 def error(msg, *args, **kwargs):
-    """
-    Log 'msg % args' with severity 'ERROR'.
-
-    To pass exception information, use the keyword argument exc_info with
-    a true value, e.g.
-
-    logger.error("Houston, we have a %s", "major problem", exc_info=1)
-    """
+    """Log 'msg % args' with severity 'ERROR'."""
+    if __logger is None:
+        return
     if __logger.isEnabledFor(logging.ERROR):
         __logger._log(logging.ERROR, msg, args, **kwargs)
 
 def fatal(msg, *args, **kwargs):
-    """
-    Don't use this method, use critical() instead.
-    """
+    """Don't use this method, use critical() instead."""
+    if __logger is None:
+        return
     if __logger.isEnabledFor(logging.FATAL):
         __logger._log(logging.FATAL, msg, args, **kwargs)

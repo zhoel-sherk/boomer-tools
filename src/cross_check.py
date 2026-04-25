@@ -21,10 +21,14 @@ class CrossCheckResult:
         self.parts_coord_conflicts: list[(str, str, float)] = []
         """Triplets (part1_designator : part2_designator : distance_mm)"""
 
+        self.parts_duplicate_coords: list[(str, str, float, float)] = []
+        """Quartets (part1_designator : part2_designator : coord_x : coord_y) - exact duplicate coordinates"""
+
 # -----------------------------------------------------------------------------
 
 def __extract_grid(grid: ConfiguredTextGrid, grid_name: str) -> dict[str, (str, str, str, str, str)]:
     """Returns dictionary: {Designator : (Comment, Coord-X, Coord-Y, Layer, Footprint)}"""
+    logger.debug(f"__extract_grid called for {grid_name}, has_column_headers={grid.has_column_headers}, designator_col={grid.designator_col}")
 
     if grid.has_column_headers:
         if type(grid.designator_col) is not str:
@@ -33,6 +37,7 @@ def __extract_grid(grid: ConfiguredTextGrid, grid_name: str) -> dict[str, (str, 
             raise ValueError(f"{grid_name} comment column id must be a string")
 
         if grid_name == "PnP":
+            logger.debug(f"PnP: coord_x_col={grid.coord_x_col}, coord_y_col={grid.coord_y_col}")
             if type(grid.coord_x_col) is not str:
                 raise ValueError(f"{grid_name} x column id must be a string")
             if type(grid.coord_y_col) is not str:
@@ -184,7 +189,8 @@ def __extract_pnp_parts(pnp: ConfiguredTextGrid) -> dict[str, (str, str, str, st
     @return A dictionary mapping designators to their properties.
     @retval (Comment, Coord-X, Coord-Y, Layer, Footprint)
     """
-    return __extract_grid(pnp, "PnP")
+    parts = __extract_grid(pnp, "PnP")
+    return parts
 
 def __txt_to_mm(coord: tuple[str, str], coord_unit_mils: bool) -> tuple[float, float]:
     MIL_PER_MM = 0.0254
@@ -204,6 +210,32 @@ def __txt_to_mm(coord: tuple[str, str], coord_unit_mils: bool) -> tuple[float, f
     except Exception as e:
         logger.warning(f"Conversion error at: {coord[0]}:{coord[1]}")
         return (0, 0)
+
+def __check_duplicates(pnp_parts: dict[str, (str, str, str, str, str)], coord_unit_mils: bool) -> list[(str, str, float, float)]:
+    """Check for exact duplicate coordinates (same X and Y)"""
+    coord_map: dict[tuple[float, float], list[str]] = {}
+    output: list[(str, str, float, float)] = []
+
+    for key in pnp_parts:
+        cx = pnp_parts[key][1]
+        cy = pnp_parts[key][2]
+        coord = __txt_to_mm((cx, cy), coord_unit_mils)
+        if coord[0] == 0 and coord[1] == 0:
+            logger.warning(f"Zero coordinates for part {key}: {cx}, {cy}")
+        coord_key = (coord[0], coord[1])
+        if coord_key not in coord_map:
+            coord_map[coord_key] = []
+        coord_map[coord_key].append(key)
+
+    for coord_key, parts in coord_map.items():
+        if len(parts) > 1:
+            parts = natsort.natsorted(parts)
+            for i in range(len(parts)):
+                for j in range(i + 1, len(parts)):
+                    output.append((parts[i], parts[j], coord_key[0], coord_key[1]))
+
+    return natsort.natsorted(output)
+
 
 def __check_distances(pnp_parts: dict[str, (str, str, str, str, str)], min_distance: float | None, coord_unit_mils: bool) -> list[(str, str, float)]:
     if min_distance is None:
@@ -276,6 +308,10 @@ def __compare(bom_parts: dict[str, (str, str, str, str, str)],
     logger.info("Calculate parts center distances...")
     result.parts_coord_conflicts = __check_distances(pnp_parts, min_distance, coord_unit_mils)
     result.parts_coord_conflicts = natsort.natsorted(result.parts_coord_conflicts)
+
+    # check for duplicate coordinates
+    logger.info("Check for duplicate coordinates...")
+    result.parts_duplicate_coords = __check_duplicates(pnp_parts, coord_unit_mils)
 
     #
     return result

@@ -302,3 +302,15 @@ class Project:
         section["pnp2"] = self.pnp2_fname
         section["profile"] = self.profile.name
         self.save()
+
+    def reset(self):
+        """Reset project data, reuse the config"""
+        self.bom_path = "<bom_path>"
+        self.pnp_fname = "<pnp_fname>"
+        self.pnp2_fname = ""
+        self.bom_grid = None
+        self.bom_grid_dirty = False
+        self.pnp_grid = None
+        self.pnp_grid_dirty = False
+        self.loading = False
+        self.profile = Profile(cfgparser=self.__config)

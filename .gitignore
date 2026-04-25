@@ -1,17 +1,55 @@
 *.~*
 *.py[cod]
-*.coverage
+*.pyo
+*.pyd
 *dump*
+
+# Python caches / test output
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+*.coverage
+coverage.xml
+htmlcov/
+
+# Local app/runtime state
 boomer.ini
-# TODO.*
-# .vscode/bookmarks.json
+logs/
+temp/
+bookmarks.json
+.DS_Store
+
+# Autosave / recovery snapshots if app data is redirected into the repo
+*.pkl
+*.pkl.tmp
+*.json.tmp
+autosave/
+recovery/
+working_copies/
+working-copies/
+Boomer/
+BoomerPySide6/
+
+# Generated exports / reports
+*_edited.csv
+*_cleaned.csv
+*_cleaned.xlsx
+merge_top_*.csv
+merge_bot_*.csv
+merged*.csv
+merged*.xlsx
+report*.html
 examples/*/*.html
+
+# Local-only example/archive folders
 examples/SmoCharger/
 examples2/
-*_edited.csv
-logs/
-__pycache__/
 example_ctk/
-htmlcov/
+
+# Optional vendored dependency experiments
 src/odfpy
-bookmarks.json
+
+# Keep the shared example/user component database tracked.
+!components.txt

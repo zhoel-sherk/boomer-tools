@@ -99,7 +99,7 @@ def __format_distance(dsgn1: str, dsgn1_w: int, dsgn2: str, dsgn2_w: int, distan
 # -----------------------------------------------------------------------------
 
 def prepare_html_report(bom_name: str, pnp_names: tuple[str, str], min_distance: float | None, ccresult: cross_check.CrossCheckResult) -> str:
-    # html/body tags not necessary, moreover disadviced when used with the `klembord`
+    # html/body tags are intentionally omitted for embedding/copying the report body.
     output = __html_title(f'Cross-check report for: <em>{bom_name}</em>')
 
     if pnp_names[1] == "":
@@ -174,6 +174,27 @@ def prepare_html_report(bom_name: str, pnp_names: tuple[str, str], min_distance:
     # format the output
     for item in ccresult.parts_coord_conflicts:
         section += __format_distance(item[0], dsgn1_w, item[1], dsgn2_w, item[2])
+
+    section += __html_section_end()
+    output += section
+
+    ### 5th section:
+    section = __html_header(f'PnP duplicate coordinates (exact match): {len(ccresult.parts_duplicate_coords)}')
+    section += __html_section_begin()
+    # determine columns width
+    dsgn1_w = 0
+    dsgn2_w = 0
+    for item in ccresult.parts_duplicate_coords:
+        dsgn1_w = max(len(item[0]), dsgn1_w)
+        dsgn2_w = max(len(item[1]), dsgn2_w)
+    # format the output
+    for item in ccresult.parts_duplicate_coords:
+        section += '{dsgn1:>{w1}} <--> {dsgn2:{w2}} = ({x:.1f}, {y:.1f}){eol}'.format(
+            dsgn1=item[0], w1=dsgn1_w,
+            dsgn2=item[1], w2=dsgn2_w,
+            x=item[2], y=item[3],
+            eol=PRE_EOL
+        )
 
     section += __html_section_end()
     output += section
