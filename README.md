@@ -1,4 +1,4 @@
-# Boomer Tools
+# Boomer Tools (WIP)
 
 Boomer Tools is an active fork of the original Boomer BOM/PnP comparator.
 
@@ -227,7 +227,3 @@ Core services
 ```
 
 The PySide6 desktop UI remains the primary supported interface for now.
-
-## Security
-
-Do not commit credentials, tokens, customer production files, private BOMs, or machine-specific secrets. If a GitHub token was pasted into chat or a local file, revoke/rotate it before pushing.
