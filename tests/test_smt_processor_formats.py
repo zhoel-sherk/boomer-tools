@@ -144,6 +144,32 @@ def test_merge_delete_dnp_skips_refs_missing_from_bom():
     assert "R3" not in set(merged["Ref"])
 
 
+def test_merge_bom_pnp_with_integer_column_names():
+    """DataFrames with RangeIndex columns (0,1,2,...) must not call .strip() on int."""
+    bom = pd.DataFrame([["R1", "10K"], ["C1", "100n"]])
+    pnp = pd.DataFrame(
+        [
+            ["R1", 10.0, 20.0, 0, "R0402"],
+            ["C1", 30.0, 40.0, 90, "C0402"],
+        ]
+    )
+    proc = smt_processor.SMTDataProcessor().set_dataframes(
+        bom,
+        pnp,
+        smt_processor.ColumnConfig(designator=0, comment=1),
+        smt_processor.ColumnConfig(
+            designator=0,
+            coord_x=1,
+            coord_y=2,
+            rotation=3,
+            footprint=4,
+        ),
+    )
+    merged = proc.merge_bom_pnp(include_dnp=True)
+    assert len(merged) == 2
+    assert set(merged["Ref"]) == {"R1", "C1"}
+
+
 def test_eagle_cmp_auto_separator():
     """auto path must detect Board/fixed same as 2+sp for cmp.txt."""
     example_path = os.path.join(os.path.dirname(tests_path), "..", "examples", "example6", "cmp.txt")

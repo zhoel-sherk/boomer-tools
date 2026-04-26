@@ -17,6 +17,21 @@ This cycle turned the PySide6 version into the primary working desktop app for r
 - Merge gained DNP filtering, PnP replacement, and layer-aware Top/Bot exports.
 - Tests were expanded around the new parser, merge, file-reader, working-copy, and duplicate-coordinate behavior.
 
+### PCB Preview (WIP)
+
+- Added **PCB Preview** tab: Gerber layers via [gerbonara](https://pypi.org/project/gerbonara/) (SVG rasterized in-scene), PnP overlay from the current PnP table (`pcb_preview_bridge`, `src/pcb_preview/`).
+- Gerber: multiple layers, visibility toggles, units hint (Auto / mm / optional inch→mm scale), higher raster DPI for sharper preview, smooth pixmap scaling.
+- PnP: footprint outlines from optional `.kicad_mod` import ([kiutils](https://github.com/hvr/kicad-parser) — see `requirements.txt` GPL note), centroid + X-cross markers, larger ref labels, mirror X/Y, compact **nudge** control (mm step) in the left sidebar, wheel zoom, Fit all.
+- Automated 2-point Gerber↔PnP alignment UI is temporarily disabled in favor of manual nudge; can be re-enabled from commented blocks in `pcb_preview_tab.py`.
+
+### BOM / PnP table editing
+
+- Fixed crashes when editing numeric cells in BOM/PnP (and Clean preview) tables: Qt commits **strings** from editors while pandas columns are `int64`/`float64`. `PandasTableModel.setData` now coerces values through `_coerce_edit_value_for_dataframe` in `src/qt_models.py`.
+
+### Dependencies
+
+- Declared `gerbonara` and `kiutils` in `requirements.txt` for PCB preview (Gerber + optional KiCad footprint import).
+
 ### Clean BOM
 
 - Added template-based output formatting through `CleanConfig`.

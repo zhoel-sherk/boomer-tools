@@ -48,6 +48,9 @@ examples/SmoCharger/
 examples2/
 example_ctk/
 
+# Local-only AI / agent context (not shipped in git)
+LLM.md
+
 # Optional vendored dependency experiments
 src/odfpy
 

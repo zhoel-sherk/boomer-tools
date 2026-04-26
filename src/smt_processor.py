@@ -923,12 +923,12 @@ class SMTDataProcessor:
         # Находим дополнительные колонки
         coord_x_col = coord_y_col = footprint_col = None
         for c in cols:
-            c_upper = c.strip().upper()
-            if config.coord_x not in ("?", "_skip_", None) and c_upper == config.coord_x.upper():
+            c_upper = str(c).strip().upper()
+            if config.coord_x not in ("?", "_skip_", None) and c_upper == str(config.coord_x).strip().upper():
                 coord_x_col = c
-            if config.coord_y not in ("?", "_skip_", None) and c_upper == config.coord_y.upper():
+            if config.coord_y not in ("?", "_skip_", None) and c_upper == str(config.coord_y).strip().upper():
                 coord_y_col = c
-            if config.footprint not in ("?", "_skip_", None) and c_upper == config.footprint.upper():
+            if config.footprint not in ("?", "_skip_", None) and c_upper == str(config.footprint).strip().upper():
                 footprint_col = c
         
         for _, row in self._pnp_df.iterrows():
@@ -1026,33 +1026,33 @@ class SMTDataProcessor:
         
         bom_designator_col = bom_comment_col = None
         for c in bom_cols:
-            c_upper = c.strip().upper()
-            if bom_config.designator != "?" and c_upper == bom_config.designator.upper():
+            c_upper = str(c).strip().upper()
+            if bom_config.designator != "?" and c_upper == str(bom_config.designator).strip().upper():
                 bom_designator_col = c
-            if bom_config.comment != "?" and c_upper == bom_config.comment.upper():
+            if bom_config.comment != "?" and c_upper == str(bom_config.comment).strip().upper():
                 bom_comment_col = c
         
         pnp_designator_col = pnp_comment_col = None
         for c in pnp_cols:
-            c_upper = c.strip().upper()
-            if pnp_config.designator != "?" and c_upper == pnp_config.designator.upper():
+            c_upper = str(c).strip().upper()
+            if pnp_config.designator != "?" and c_upper == str(pnp_config.designator).strip().upper():
                 pnp_designator_col = c
-            if pnp_config.comment != "?" and c_upper == pnp_config.comment.upper():
+            if pnp_config.comment != "?" and c_upper == str(pnp_config.comment).strip().upper():
                 pnp_comment_col = c
         
         # PnP дополнительные колонки
         pnp_x_col = pnp_y_col = pnp_rot_col = pnp_layer_col = pnp_fp_col = None
         for c in pnp_cols:
-            c_upper = c.strip().upper()
-            if pnp_config.coord_x != "?" and c_upper == pnp_config.coord_x.upper():
+            c_upper = str(c).strip().upper()
+            if pnp_config.coord_x != "?" and c_upper == str(pnp_config.coord_x).strip().upper():
                 pnp_x_col = c
-            if pnp_config.coord_y != "?" and c_upper == pnp_config.coord_y.upper():
+            if pnp_config.coord_y != "?" and c_upper == str(pnp_config.coord_y).strip().upper():
                 pnp_y_col = c
-            if pnp_config.rotation != "?" and c_upper == pnp_config.rotation.upper():
+            if pnp_config.rotation != "?" and c_upper == str(pnp_config.rotation).strip().upper():
                 pnp_rot_col = c
-            if pnp_config.layer != "?" and c_upper == pnp_config.layer.upper():
+            if pnp_config.layer != "?" and c_upper == str(pnp_config.layer).strip().upper():
                 pnp_layer_col = c
-            if pnp_config.footprint != "?" and c_upper == pnp_config.footprint.upper():
+            if pnp_config.footprint != "?" and c_upper == str(pnp_config.footprint).strip().upper():
                 pnp_fp_col = c
         
         def _ref_key(value: object) -> str:
@@ -1094,7 +1094,7 @@ class SMTDataProcessor:
                 value = str(row[pnp_comment_col]) if pnp_comment_col and not pd.isna(row[pnp_comment_col]) else ""
             
             # Skip DNP
-            if not include_dnp and value.upper() in ["DNP", "DNP_FROM_BOM"]:
+            if not include_dnp and str(value).strip().upper() in ["DNP", "DNP_FROM_BOM"]:
                 continue
             
             # Coordinates

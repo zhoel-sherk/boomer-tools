@@ -36,6 +36,8 @@ from component_library import append_component, default_components_path
 from pn_original import normalize_mpn_bare
 from working_copy import find_snapshot, save_snapshot
 
+from pcb_preview_tab import PcbPreviewTab
+
 import logger
 
 APP_NAME = "BOM vs PnP Cross Checker"
@@ -136,6 +138,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._create_clean_tab()
         self._create_merge_tab()
         self._create_report_tab()
+        self._create_pcb_preview_tab()
         
         # Theme toggle в status bar
         self.statusBar().showMessage("Ready")
@@ -1433,6 +1436,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.result_model = SortableTableModel(pd.DataFrame())
         self.result_table.setModel(self.result_model)
         layout.addWidget(self.result_table, 1)
+
+    def _create_pcb_preview_tab(self) -> None:
+        self._pcb_tab = PcbPreviewTab(self)
+        self.tabs.addTab(self._pcb_tab, "PCB Preview")
+        self.tabs.currentChanged.connect(self._on_main_tab_changed)
+
+    def _on_main_tab_changed(self, idx: int) -> None:
+        if self.tabs.widget(idx) is getattr(self, "_pcb_tab", None):
+            self._refresh_pcb_preview_from_ui()
+
+    def _pcb_preview_bridge_kwargs(self) -> Optional[dict]:
+        self._sync_pnp_df_from_model()
+        if self._pnp_df is None or not hasattr(self, "pnp_col_combos") or not self.pnp_col_combos:
+            return None
+        cols = list(self._pnp_df.columns)
+        m: dict[str, object] = {}
+        for i, combo in enumerate(self.pnp_col_combos):
+            label = combo.currentText()
+            if label != "-":
+                m[label] = cols[i]
+        ref = m.get("REF")
+        xc = m.get("X")
+        yc = m.get("Y")
+        if not ref or not xc or not yc:
+            return None
+        return {
+            "designator_col": ref,
+            "x_col": xc,
+            "y_col": yc,
+            "rot_col": m.get("Rotation"),
+            "layer_col": m.get("Layer"),
+            "footprint_col": m.get("Footprint"),
+            "value_col": m.get("Value"),
+            "comment_col": m.get("Comment"),
+            "coord_unit_mm": not self.pnp_units_mils.isChecked(),
+        }
+
+    def _refresh_pcb_preview_from_ui(self) -> None:
+        kwargs = self._pcb_preview_bridge_kwargs()
+        if kwargs is None:
+            return
+        self._pcb_tab.set_placements_from_dataframe(self._pnp_df, **kwargs)
     
     # =========================================================================
     # File handling

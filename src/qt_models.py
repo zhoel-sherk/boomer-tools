@@ -12,6 +12,79 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6 import QtGui
 
 
+def _coerce_edit_value_for_dataframe(value: Any, col_dtype: Any) -> Any:
+    """
+    Приводит значение из редактора Qt (часто str) к типу, совместимому с dtype столбца.
+    """
+    if value is None:
+        if pd.api.types.is_extension_array_dtype(col_dtype):
+            return pd.NA
+        if pd.api.types.is_float_dtype(col_dtype) or pd.api.types.is_complex_dtype(col_dtype):
+            return np.nan
+        if pd.api.types.is_integer_dtype(col_dtype):
+            raise ValueError("null in non-nullable integer column")
+        return ""
+
+    if hasattr(value, "item") and callable(getattr(value, "item", None)):
+        try:
+            value = value.item()
+        except (ValueError, AttributeError):
+            pass
+
+    if isinstance(value, (bool, np.bool_)):
+        if pd.api.types.is_bool_dtype(col_dtype):
+            return bool(value)
+        if pd.api.types.is_numeric_dtype(col_dtype):
+            return int(value)
+        return str(value)
+
+    if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+        if pd.api.types.is_float_dtype(col_dtype) or pd.api.types.is_complex_dtype(col_dtype):
+            return float(value)
+        if pd.api.types.is_integer_dtype(col_dtype):
+            return int(value)
+        if pd.api.types.is_bool_dtype(col_dtype):
+            return bool(value)
+        return int(value)
+
+    if isinstance(value, (float, np.floating)) and not isinstance(value, bool):
+        if pd.api.types.is_integer_dtype(col_dtype):
+            x = float(value)
+            if not np.isfinite(x):
+                raise ValueError("non-finite")
+            return int(round(x))
+        return float(value)
+
+    if isinstance(value, str):
+        s = value.strip().replace("\u00a0", " ").replace(",", ".")
+        if pd.api.types.is_bool_dtype(col_dtype):
+            sl = s.lower()
+            if sl in ("", "0", "no", "false", "n"):
+                return False
+            if sl in ("1", "yes", "true", "y"):
+                return True
+            raise ValueError(f"unrecognized bool: {value!r}")
+
+        if pd.api.types.is_numeric_dtype(col_dtype):
+            if s == "" or s.lower() in ("nan", "none", "nat"):
+                if pd.api.types.is_extension_array_dtype(col_dtype):
+                    return pd.NA
+                if pd.api.types.is_float_dtype(col_dtype) or pd.api.types.is_complex_dtype(col_dtype):
+                    return np.nan
+                raise ValueError("empty numeric integer cell")
+
+            parsed = float(s)
+            if not np.isfinite(parsed):
+                raise ValueError("non-finite")
+            if pd.api.types.is_integer_dtype(col_dtype):
+                return int(round(parsed))
+            return parsed
+
+        return value
+
+    return value
+
+
 class PandasTableModel(QAbstractTableModel):
     """
     Универсальная модель для отображения pandas DataFrame в QTableView.
@@ -138,7 +211,12 @@ class PandasTableModel(QAbstractTableModel):
         col = index.column()
         if row >= len(self._df) or col >= len(self._df.columns):
             return False
-        self._df.iat[row, col] = value
+        col_dtype = self._df.dtypes.iloc[col]
+        try:
+            coerced = _coerce_edit_value_for_dataframe(value, col_dtype)
+            self._df.iat[row, col] = coerced
+        except (ValueError, TypeError, OverflowError):
+            return False
         self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
         return True
     

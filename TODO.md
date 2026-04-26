@@ -53,6 +53,14 @@ Core services
 - [x] Cross-check runs in a background thread.
 - [x] Theme toggle exists.
 
+### PCB Preview (WIP)
+
+- [x] **PCB Preview** tab in PySide6 (`src/pcb_preview_tab.py`, `src/pcb_preview/`, bridge from current PnP table).
+- [x] Gerber stack: load layers, visibility, units (Auto/mm/inch scale), wheel zoom, Fit all, higher raster DPI (gerbonara → SVG).
+- [x] PnP overlay on Gerber: centroids, optional `.kicad_mod` outlines (kiutils), ref labels, mirror X/Y, mm **nudge** in sidebar.
+- [ ] Revisit automated 2-point Gerber↔PnP alignment (currently commented in favor of manual nudge).
+- [ ] Add focused tests and small Gerber/PnP fixtures for the Qt-free preview core.
+
 ### Clean BOM
 
 - [x] `clean_component.clean_one` integrates vendor PN parsers, regex cleanup, and user component library lookup.
@@ -166,6 +174,16 @@ Known full-suite failures to classify/fix:
 
 Full legacy test-suite cleanup is still pending; these failures are recorded separately from the targeted working-path checks.
 
+### Yedytor / Yamaha (concrete integration steps)
+
+Reference: [yedytor](https://github.com/marmidr/yedytor) (MIT) — parsers and matching ideas for Yamaha `.Tou`, `DevLibEd*.Lib`, and spreadsheet PnP import; **not** a port of its CustomTkinter UI. Full machine-library goals and row-status semantics remain in **Phase 5** below; this list is sequencing only.
+
+- [ ] Add a **Qt-free** machine-library package or module (same separation style as `src/pcb_preview/`): load `.Tou` / `DevLibEd*.Lib`, normalized search records, no PySide6 imports in the parser core.
+- [ ] Add minimal sanitized fixtures and unit tests for Tou/Lib parsing before wiring UI.
+- [ ] Register a PySide6 **Machine library / Yamaha** tab or subpanel from `src/app_pyside6.py` (alongside PCB Preview), calling only the service layer.
+- [ ] Bridge **Merge** / PnP `DataFrame` into that UI (line status, MRU, auto-match by footprint + comment — align with Phase 5 bullets).
+- [ ] When exporting, reuse strict validation ideas from yedytor (warn/block on unresolved rows) once matching columns exist in Merge.
+
 ## Immediate Next Priorities
 
 ### 1. GitHub Documentation Prep
@@ -226,6 +244,9 @@ Full legacy test-suite cleanup is still pending; these failures are recorded sep
 - [ ] Save sample expected outputs for representative projects.
 - [ ] Collect remaining `regex` and `OTHER` fallback rows from real BOMs.
 - [ ] Promote frequent stable fallbacks to focused parsers or presets.
+- [ ] Collect real machine-library files for matching research:
+  - Yamaha `.Tou` / `DevLibEd.Lib` examples from `marmidr/yedytor`;
+  - Hanwha `.mdb` database files from production.
 
 ## Roadmap
 
@@ -300,7 +321,68 @@ Full legacy test-suite cleanup is still pending; these failures are recorded sep
 - [ ] Consider SQLite when `components.txt` becomes too large or needs safe editing.
 - [ ] Keep `components.txt` as import/export format even if SQLite is added.
 
-### Phase 5 - Merge / Machine Export
+### Phase 5 - Machine Library Matching
+
+Goal: turn Clean BOM + Merge output into machine-ready component names by matching cleaned component values and footprints against real pick-and-place machine libraries.
+
+For implementation order (fixtures → service → tab → DataFrame bridge), see **Yedytor / Yamaha (concrete integration steps)** under *Current State* above.
+
+Useful reference:
+
+- `marmidr/yedytor` is a related Yamaha PnP editor by the upstream author.
+- Its useful ideas are domain logic, not the old `customtkinter` UI:
+  - Yamaha `.Tou` reader;
+  - Yamaha `DevLibEd.Lib` / `DevLibEd2.Lib` reader;
+  - component DB with aliases and hidden entries;
+  - Most Recently Used selections per search filter;
+  - auto-match by `footprint + comment`;
+  - row status markers such as no-match, filtered, auto-selected, manually-selected, removed;
+  - block or warn before export when unresolved rows remain.
+
+Planned machine-library support:
+
+- [ ] Add a GUI-independent machine library service.
+- [ ] Define a normalized machine component record:
+  - machine type/vendor;
+  - source file path;
+  - raw machine component name;
+  - normalized canonical name;
+  - aliases;
+  - package/footprint;
+  - value/comment tokens;
+  - hidden/disabled flag;
+  - optional feeder/nozzle fields when available.
+- [ ] Add Yamaha import:
+  - `.Tou`;
+  - `DevLibEd.Lib`;
+  - `DevLibEd2.Lib`.
+- [ ] Add Hanwha import after real `.mdb` samples are available.
+- [ ] Research Hanwha `.mdb` access options:
+  - `pyodbc` / Access ODBC on Windows;
+  - `mdbtools` on Linux;
+  - export-to-CSV fallback if direct DB access is unreliable.
+- [ ] Add tests using small sanitized sample machine-library fixtures.
+- [ ] Add auto-match candidates using:
+  - cleaned BOM value;
+  - PnP footprint/package;
+  - raw BOM comment;
+  - aliases;
+  - recent manual selections.
+- [ ] Add row status for machine matching:
+  - no match;
+  - candidate/filter match;
+  - auto-selected;
+  - manually-selected;
+  - removed/DNP.
+- [ ] Add MRU ranking so repeated manual choices appear first for the same filter.
+- [ ] Add optional strict export validation:
+  - warn or block export if unresolved machine component names remain.
+- [ ] Decide where machine-selected names appear:
+  - extra Merge columns;
+  - replacement PnP component column;
+  - separate machine export profile.
+
+### Phase 6 - Merge / Machine Export
 
 - [ ] Confirm the final machine-required column names for Top/Bot exports.
 - [ ] Add export presets if different machines require different CSV layouts.
@@ -309,8 +391,9 @@ Full legacy test-suite cleanup is still pending; these failures are recorded sep
   - included in exported filename;
   - included in a sidecar note/report.
 - [ ] Add optional coordinate transforms only after a real machine format requires them.
+- [ ] Add machine export profiles once Yamaha and Hanwha component matching are stable.
 
-### Phase 6 - PySide6 UI Split
+### Phase 7 - PySide6 UI Split
 
 - [ ] Split `src/app_pyside6.py` into smaller UI modules:
   - `ui/main_window.py`;
@@ -330,13 +413,14 @@ Full legacy test-suite cleanup is still pending; these failures are recorded sep
   - export selected rows;
   - jump from Clean preview row to source BOM row.
 
-### Phase 7 - CLI / Batch Mode
+### Phase 8 - CLI / Batch Mode
 
 - [ ] Add a CLI entrypoint using the same service layer.
 - [ ] Candidate commands:
   - `boomer clean BOM.xlsx --comment-col Comment --out cleaned.xlsx`;
   - `boomer check BOM.xlsx PNP.csv --profile profile.json`;
   - `boomer merge BOM.xlsx PNP.csv --out merge.csv`;
+  - `boomer machine-match BOM.xlsx PNP.csv --machine-db machine.json --out merge.csv`;
   - `boomer unresolved BOM.xlsx --out unresolved.csv`.
 - [ ] Add JSON profile support:
   - file options;
@@ -345,9 +429,14 @@ Full legacy test-suite cleanup is still pending; these failures are recorded sep
   - column mappings;
   - clean templates;
   - component DB path.
+- [ ] Add machine-library profile fields:
+  - machine vendor;
+  - machine DB path;
+  - strict unresolved-row policy;
+  - export profile.
 - [ ] Use CLI flows in end-to-end regression tests.
 
-### Phase 8 - Web Later
+### Phase 9 - Web Later
 
 - [x] Remove current web prototypes from the repository.
 - [ ] Do not rebuild web UI until the service layer is stable.
@@ -362,7 +451,7 @@ Full legacy test-suite cleanup is still pending; these failures are recorded sep
   - shared component DB locking;
   - clear export/download flow.
 
-### Phase 9 - Packaging / Distribution
+### Phase 10 - Packaging / Distribution
 
 - [ ] Decide supported targets:
   - Linux workstation;
@@ -375,7 +464,7 @@ Full legacy test-suite cleanup is still pending; these failures are recorded sep
   - simple venv-based install.
 - [ ] Add app icon, version, and About dialog later.
 
-### Phase 10 - Test Suite Cleanup
+### Phase 11 - Test Suite Cleanup
 
 - [ ] Run full pytest suite.
 - [ ] Update obsolete tests that assume old reader behavior.
@@ -397,6 +486,11 @@ Use these names consistently:
 - Footprint / Package
 - Feeder Library
 - Machine Component Library
+- Machine Library Matching
+- Machine Component Name
+- Yamaha `.Tou`
+- Yamaha `DevLibEd.Lib`
+- Hanwha `.mdb`
 - Pick-and-Place
 - Top side
 - Bottom side

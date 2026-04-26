@@ -17,6 +17,10 @@ python src/app_pyside6.py
 
 Legacy desktop entrypoints and web prototypes were removed from this fork. Future web work should be rebuilt on top of shared core services after the desktop workflow is stable.
 
+**Work in progress — PCB Preview:** the PySide6 app includes a **PCB Preview** tab that stacks Gerber layers (via [gerbonara](https://pypi.org/project/gerbonara/)) and draws the current PnP table on top: zoom and pan, optional KiCad `.kicad_mod` footprint outlines where configured, placement labels, mirror X/Y, and a small mm **nudge** control to align the overlay with the board image. This is **Gerber-based visualization**, separate from any future Yamaha machine-library work.
+
+**Planned — machine / Yamaha segment:** matching cleaned Merge output to real **Yamaha** machine libraries (`.Tou`, `DevLibEd*.Lib`) is on the roadmap as another desktop segment with **Qt-free** parsers/services (same layering idea as `src/pcb_preview/`), **not** a port of the CustomTkinter UI from [yedytor](https://github.com/marmidr/yedytor) (MIT), which is a useful reference for formats and matching. See [TODO.md](TODO.md) (Phase 5 and **Yedytor / Yamaha** steps).
+
 The project is actively evolving. See:
 
 - [CHANGELOG.md](CHANGELOG.md) for completed work.
@@ -95,6 +99,12 @@ Cross-check BOM and PnP data for:
   - `Export Bot`
 - Detect layer values such as `None` / `m`, `T` / `B`, or `Top` / `Bottom`.
 - Disable bottom export when only one side is detected.
+
+### PCB Preview (WIP)
+
+- Open Gerber files and toggle layer visibility; choose units and zoom to fit.
+- Overlay placements from the **PnP** tab; optional footprint geometry from KiCad `.kicad_mod` files (see `requirements.txt` for **kiutils** and its license note).
+- Nudge the overlay in millimeters and flip mirror axes when your data uses different conventions.
 
 ## Installation
 
@@ -190,7 +200,7 @@ Known failures are tracked in [TODO.md](TODO.md). They are mostly legacy reader/
 ## Repository Notes
 
 - `requirements.txt` contains the current runtime and test dependencies.
-- `.gitignore` excludes Python caches, pytest/coverage output, autosave/recovery snapshots, and generated exports.
+- `.gitignore` excludes Python caches, pytest/coverage output, autosave/recovery snapshots, generated exports, and optional local **`LLM.md`** (AI context — not part of the distributed tree).
 - `components.txt` is intentionally tracked.
 - Web prototypes were removed; future web UI should be service-backed.
 

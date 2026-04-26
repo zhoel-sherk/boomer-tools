@@ -7,6 +7,8 @@ xlrd
 openpyxl
 odfpy
 natsort
+gerbonara
+kiutils  # GPL-3.0 — footprint .kicad_mod parsing only; verify compatibility with your distribution
 
 # Test / developer tooling
 pytest
