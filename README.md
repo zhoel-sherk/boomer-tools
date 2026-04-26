@@ -17,9 +17,21 @@ python src/app_pyside6.py
 
 Legacy desktop entrypoints and web prototypes were removed from this fork. Future web work should be rebuilt on top of shared core services after the desktop workflow is stable.
 
-**Work in progress — PCB Preview:** the PySide6 app includes a **PCB Preview** tab that stacks Gerber layers (via [gerbonara](https://pypi.org/project/gerbonara/)) and draws the current PnP table on top: zoom and pan, optional KiCad `.kicad_mod` footprint outlines where configured, placement labels, mirror X/Y, and a small mm **nudge** control to align the overlay with the board image. This is **Gerber-based visualization**, separate from any future Yamaha machine-library work.
+### PCB Preview (work in progress)
 
-**Planned — machine / Yamaha segment:** matching cleaned Merge output to real **Yamaha** machine libraries (`.Tou`, `DevLibEd*.Lib`) is on the roadmap as another desktop segment with **Qt-free** parsers/services (same layering idea as `src/pcb_preview/`), **not** a port of the CustomTkinter UI from [yedytor](https://github.com/marmidr/yedytor) (MIT), which is a useful reference for formats and matching. See [TODO.md](TODO.md) (Phase 5 and **Yedytor / Yamaha** steps).
+The PySide6 app includes a **PCB Preview** tab: Gerber layers via [gerbonara](https://pypi.org/project/gerbonara/), overlay of the current PnP table, zoom/pan, optional KiCad `.kicad_mod` outlines, placement labels, mirror X/Y, and a mm **nudge** control. This is **Gerber visualization only** — separate from machine-library work below.
+
+### Machine libraries (planned)
+
+Matching cleaned **Merge** output to real pick-and-place **machine component names** will live in a dedicated desktop area, backed by **Qt-free** parsers/services (same split as `src/pcb_preview/`: no business logic stuck in `app_pyside6.py`).
+
+- **Yamaha (first target):** `.Tou` and `DevLibEd*.Lib`. Use [yedytor](https://github.com/marmidr/yedytor) (MIT) as a **reference for formats and matching ideas**, not as a CustomTkinter UI port. Concrete steps: [TODO.md](TODO.md) → Phase 5 and **Yedytor / Yamaha**.
+
+- **Hanwha (later):** shop libraries are often **Microsoft Access `.mdb`**. Import is planned **after** small sanitized **sample `.mdb`** fixtures exist. Access strategy will be platform-dependent, for example:
+  - Windows: **ODBC** (e.g. `pyodbc` + Microsoft Access driver) where the driver is available;
+  - Linux: **[mdbtools](https://github.com/mdbtools/mdbtools)** (`mdb-sql` / exports) or a **CSV dump** from the placement software if direct reads are fragile.
+
+Both vendors should converge on the **same normalized machine-component model** (search, MRU, auto-match, export checks) described in [TODO.md](TODO.md) Phase 5.
 
 The project is actively evolving. See:
 
