@@ -22,17 +22,18 @@ def test_no_separator():
 def test_csv_comma():
     # using a full asset path makes possible to run the tests from the VSCode
     grid = csv_reader.read_csv(f"{tests_path}/assets/comma.csv", ",")
-    assert grid.nrows == 12-3 # empty rows skipped
+    # Fixture is short Altium-style export: preamble lines lack enough columns and are skipped.
+    assert grid.nrows == 3  # header + 2 component rows
     assert grid.ncols == 13
-    assert grid.rows_raw()[-3][0] == "Designator"
-    # check if empty cells were appended
-    assert grid.rows_raw()[0][12] == ""
+    assert grid.rows_raw()[0][0] == "Designator"
+    assert grid.rows_raw()[0][-1] == "Pad-Y(mm)"
+    assert grid.rows_raw()[1][0] == "R52"
 
 def test_csv_spaces():
     grid = csv_reader.read_csv(f"{tests_path}/assets/spaces.csv", "*sp")
-    assert grid.nrows == 11-1
+    assert grid.nrows == 8  # variant line + header + 6 fiducials (see tests/assets/spaces.csv)
     assert grid.ncols == 8
-    assert grid.rows_raw()[-6][0] == "Fid6"
+    assert grid.rows_raw()[2][0] == "Fid6"
 
 def test_csv_tabs():
     grid = csv_reader.read_csv(f"{tests_path}/assets/tabs.csv", "\t")

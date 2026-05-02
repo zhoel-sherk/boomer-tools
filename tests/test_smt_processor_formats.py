@@ -11,7 +11,7 @@ import smt_processor
 
 
 def test_whitespace_sp_like_classic_boomer():
-    """SPACES/*sp: same filters as csv_reader; 1st row can be header via apply_row_as_column_header."""
+    """SPACES/*sp: same filters as csv_reader; optional ``apply_row_as_column_header`` for scripts."""
     content = (
         "DESIGNATOR FOOTPRINT MID-X MID-Y REF-X REF-Y PAD-X PAD-Y LAYER ROTATION COMMENT\n"
         "C167 FPC_2P 100 200 10 20 30 40 N 0 cap\n"
@@ -113,6 +113,92 @@ CP169                -11.1252     -31.7612        0    C0402
         assert str(df.iloc[1]["Footprint"]) == "C0402"
     finally:
         os.unlink(temp_path)
+
+
+def test_merge_preserves_coordinates_when_pnp_units_are_mm():
+    """Merge never rescales coordinates (Replace PNP uses this table)."""
+    bom = pd.DataFrame({"Ref": ["R1"], "Comment": ["10K"]})
+    pnp = pd.DataFrame(
+        {
+            "Ref": ["R1"],
+            "X": [106.045],
+            "Y": [-19.036],
+            "Rotation": [180],
+            "Footprint": ["C0402"],
+        }
+    )
+    proc = smt_processor.SMTDataProcessor().set_dataframes(
+        bom,
+        pnp,
+        smt_processor.ColumnConfig(designator="Ref", comment="Comment"),
+        smt_processor.ColumnConfig(
+            designator="Ref",
+            coord_x="X",
+            coord_y="Y",
+            rotation="Rotation",
+            footprint="Footprint",
+        ),
+    )
+    merged = proc.merge_bom_pnp(include_dnp=True)
+    assert merged.iloc[0]["X"] == pytest.approx(106.045)
+    assert merged.iloc[0]["Y"] == pytest.approx(-19.036)
+
+
+def test_merge_preserves_mils_magnitude():
+    """Large mil-style numbers stay unchanged in merge (no silent mm conversion)."""
+    bom = pd.DataFrame({"Ref": ["R1"], "Comment": ["10K"]})
+    pnp = pd.DataFrame(
+        {
+            "Ref": ["R1"],
+            "X": [1000.0],
+            "Y": [2000.0],
+            "Rotation": [0],
+            "Footprint": ["R0402"],
+        }
+    )
+    proc = smt_processor.SMTDataProcessor().set_dataframes(
+        bom,
+        pnp,
+        smt_processor.ColumnConfig(designator="Ref", comment="Comment"),
+        smt_processor.ColumnConfig(
+            designator="Ref",
+            coord_x="X",
+            coord_y="Y",
+            rotation="Rotation",
+            footprint="Footprint",
+        ),
+    )
+    merged = proc.merge_bom_pnp(include_dnp=True)
+    assert merged.iloc[0]["X"] == pytest.approx(1000.0)
+    assert merged.iloc[0]["Y"] == pytest.approx(2000.0)
+
+
+def test_merge_strips_trailing_mm_suffix_only():
+    bom = pd.DataFrame({"Ref": ["R1"], "Comment": ["10K"]})
+    pnp = pd.DataFrame(
+        {
+            "Ref": ["R1"],
+            "X": ["40.3456 mm"],
+            "Y": ["-12.0 MIL"],
+            "Rotation": [0],
+            "Footprint": ["R0402"],
+        }
+    )
+    proc = smt_processor.SMTDataProcessor().set_dataframes(
+        bom,
+        pnp,
+        smt_processor.ColumnConfig(designator="Ref", comment="Comment"),
+        smt_processor.ColumnConfig(
+            designator="Ref",
+            coord_x="X",
+            coord_y="Y",
+            rotation="Rotation",
+            footprint="Footprint",
+        ),
+    )
+    merged = proc.merge_bom_pnp(include_dnp=True)
+    assert merged.iloc[0]["X"] == pytest.approx(40.3456)
+    assert merged.iloc[0]["Y"] == pytest.approx(-12.0)
 
 
 def test_merge_delete_dnp_skips_refs_missing_from_bom():

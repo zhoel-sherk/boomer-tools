@@ -1,7 +1,7 @@
 """
-PandasTableModel - мост между pandas DataFrame и PySide6 QTableView.
+PandasTableModel — bridge between a pandas DataFrame and PySide6 QTableView.
 
-Наследуется от QAbstractTableModel, корректно работает с NaN/NaT из pandas.
+Subclass of QAbstractTableModel; handles pandas NaN/NaT safely.
 """
 
 import pandas as pd
@@ -14,7 +14,7 @@ from PySide6 import QtGui
 
 def _coerce_edit_value_for_dataframe(value: Any, col_dtype: Any) -> Any:
     """
-    Приводит значение из редактора Qt (часто str) к типу, совместимому с dtype столбца.
+    Coerce a value from the Qt editor (often str) to a type compatible with the column dtype.
     """
     if value is None:
         if pd.api.types.is_extension_array_dtype(col_dtype):
@@ -87,13 +87,12 @@ def _coerce_edit_value_for_dataframe(value: Any, col_dtype: Any) -> Any:
 
 class PandasTableModel(QAbstractTableModel):
     """
-    Универсальная модель для отображения pandas DataFrame в QTableView.
-    
+    Generic Qt model backed by a pandas DataFrame.
+
     Usage:
         model = PandasTableModel(df)
         table_view.setModel(model)
-        
-        # Обновление данных:
+
         model.update_dataframe(new_df)
     """
     
@@ -107,6 +106,8 @@ class PandasTableModel(QAbstractTableModel):
         self._df = dataframe if dataframe is not None else pd.DataFrame()
         self._editable = editable
         self._active_row_range: tuple[int, int] | None = None
+        self._column_display_names: dict[str, str] = {}
+        self._column_tooltips: dict[str, str] = {}
     
     # =========================================================================
     # Required Abstract Methods
@@ -161,10 +162,13 @@ class PandasTableModel(QAbstractTableModel):
         role: int = Qt.ItemDataRole.DisplayRole,
     ) -> Any:
         if orientation == Qt.Orientation.Horizontal:
-            if role != Qt.ItemDataRole.DisplayRole:
+            if section >= len(self._df.columns):
                 return None
-            if section < len(self._df.columns):
-                return str(self._df.columns[section])
+            col_name = str(self._df.columns[section])
+            if role == Qt.ItemDataRole.DisplayRole:
+                return self._column_display_names.get(col_name, col_name)
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return self._column_tooltips.get(col_name) or col_name
             return None
         
         elif orientation == Qt.Orientation.Vertical:
@@ -241,6 +245,37 @@ class PandasTableModel(QAbstractTableModel):
     def get_dataframe(self) -> pd.DataFrame:
         return self._df
 
+    def set_column_header_metadata(self, display: dict[str, str], tooltips: dict[str, str]) -> None:
+        self._column_display_names = dict(display)
+        self._column_tooltips = dict(tooltips)
+        if len(self._df.columns):
+            self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, len(self._df.columns) - 1)
+
+    def apply_row_patch(self, row: int, patch: dict[str, Any]) -> bool:
+        """Apply string/coerced values to one row; emits dataChanged for touched columns."""
+        if row < 0 or row >= len(self._df):
+            return False
+        cols = list(self._df.columns)
+        changed_j: list[int] = []
+        for key, value in patch.items():
+            if key not in cols:
+                continue
+            j = cols.index(key)
+            col_dtype = self._df.dtypes.iloc[j]
+            try:
+                coerced = _coerce_edit_value_for_dataframe(value, col_dtype)
+                self._df.iat[row, j] = coerced
+                changed_j.append(j)
+            except (ValueError, TypeError, OverflowError):
+                return False
+        if not changed_j:
+            return True
+        lo, hi = min(changed_j), max(changed_j)
+        tl = self.index(row, lo)
+        br = self.index(row, hi)
+        self.dataChanged.emit(tl, br, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
+        return True
+
     def set_active_row_range(self, first: int | None, last: int | None) -> None:
         if first is None or last is None or first < 1 or last < first:
             self._active_row_range = None
@@ -298,12 +333,12 @@ class PandasTableModel(QAbstractTableModel):
 
 
 class ReadOnlyTableModel(PandasTableModel):
-    """Read-only модель без редактирования"""
+    """Read-only table model (no in-place cell edits)."""
     pass
 
 
 class SortableTableModel(PandasTableModel):
-    """Сортируемая модель (клик по заголовку)"""
+    """Sortable model (click header to sort; optional sort arrow in header text)."""
     
     def __init__(
         self,

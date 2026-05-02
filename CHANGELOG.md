@@ -5,7 +5,62 @@ All notable changes for this fork are tracked here.
 Fork: `zhoel-sherk/boomer-tools`  
 Upstream: `marmidr/boomer`
 
+## ALPHA v0.1.0 — 2026-05-01
+
+### Branding and lifecycle
+
+- Desktop app display name **Boomer Tools**; window title includes **ALPHA v0.1.0**.
+- **QSettings** application key is now **`BoomerTools`** (organization **Boomer**). Earlier **`BoomerPySide6`** entries are not migrated — settings reset once for ALPHA testers.
+- Yellow **Work in progress** banner on the main window; Hanwha MDB sub-windows tagged **(WIP)** in titles.
+
+### BOM / PnP persistence
+
+- Per **loaded file path** (stable hash), persist BOM/PnP tab: separator, **Has headers**, **1st** / **Last** row, and **per-column mapping** dropdown values (`bom/ui/<hash>/…`, `pnp/ui/<hash>/…`).
+- Restored **before** reloading from disk when opening a known path (skipped when loading a recovered pickle snapshot).
+
+### Recovery UX
+
+- **`working_copy_ui.prompt_recover_snapshot`** centralizes the “Recovered working copy found” dialog (BOM/PnP unchanged behaviour).
+- **Hanwha MDB editor:** debounced autosave of the enriched grid under `…/autosave/hanwha_mdb/` (`kind=hanwha_mdb`); same recovery prompt on open; **Reload** forces fresh read from `.mdb` (skips recovery prompt intent).
+
+### Code hygiene
+
+- Russian comments/docstrings in `src/**/*.py` translated to English (incl. `smt_processor.py`, `qt_models.py`, `pcb_preview_tab.py`, and other modules touched in that sweep).
+- New helpers: [`src/settings_paths.py`](src/settings_paths.py), [`src/working_copy_ui.py`](src/working_copy_ui.py).
+- Tests: [`tests/test_settings_paths.py`](tests/test_settings_paths.py), [`tests/test_qsettings_bom_pnp_persist.py`](tests/test_qsettings_bom_pnp_persist.py), [`tests/test_working_copy_ui.py`](tests/test_working_copy_ui.py).
+
+### Reference vendoring
+
+- **`yedytor/`** placeholder + [`doc/machine_lib_yedytor_notes.md`](doc/machine_lib_yedytor_notes.md): Hanwha-first machine_lib direction; Yamaha/yedytor patterns second. Submodule `git submodule add` when GitHub is reachable.
+
 ## Unreleased - 2026-04-25
+
+### GUI profiles and workspace clearing (2026-04-26)
+
+- **Named UI profiles** on the Project tab (`default` plus **Clone…** / **Delete**): each profile stores a JSON snapshot under `profiles/<name>/state_json` in `QSettings` — theme, language, colorful logs, BOM/PnP load controls and **column mapping combo values** (not loaded file paths), Merge **Delete DNP**, Report severity/overlap toggles, Clean BOM preferences, and PCB Preview UI prefs (mirror, Gerber unit mode, nudge step — still **no** persisted Gerber layer paths).
+- **On quit**, the **active** profile is saved; legacy **`files/last_bom`** / **`files/last_pnp`** keys are cleared and no longer written when loading files — **last-opened paths are not restored** across sessions (per-path hash settings for BOM/PnP tabs still apply when you reopen the same file).
+- **Clear** on the BOM and PnP tabs unloads the table and mapping widgets (workspace only).
+- **i18n:** `boomer/lang/en.json` and `boomer/lang/ru.json` extended for profile dialogs and Clear actions.
+- **Fix:** `_load_legacy_settings_flat` indentation bug that caused `IndentationError` at startup.
+
+### Removed unused `src/` modules
+
+- Deleted **`profile_settings.py`** and **`qt_header_mapper.py`** (no imports from the app or tests; BOM/PnP column mapping is handled in **`app_pyside6.py`**).
+- **Audit:** `bom_clean.py`, **`project.py`** (boomer `src/`, distinct from **`yedytor/src/project.py`**), **`report_generator.py`**, and unused **`src/themes/`** were already absent from the tree and had no remaining code references — consolidated note here for clarity.
+- **`README.md`** / **`TODO.md`:** no stale mentions. **`LLM.md`** updated to match the current report stack (**`report_html.py`** only).
+
+### Documentation and roadmap (2026-05-02)
+
+- **`TODO.md`:** Explicit **core vs GUI** rule (no `PySide6` in parsing/merge/check paths); new **Performance (profiling-driven)** backlog (pandas hot paths, optional calamine / XlsxWriter / Parquet, profile before optimizing); Phase 2 extended with a thin **facade** and optional CI guard on core imports; Phase 7 documents `src/ui/` vs `src/gui/` and optional `threads` module; Status footer points at service extraction and perf work.
+- **`LLM.md`:** Expanded **Architecture Snapshot** (core vs presentation, what “fully separate” means, facade and UI file split, performance pointer to `TODO.md`); entrypoint note that `app_pyside6.py` should shrink to wiring; **Guidance For Future AI Work** updated (no Qt in listed core packages, optimization order).
+
+### Machine library (Hanwha UPD .mdb, WIP)
+
+- Qt-free reader **`src/machine_library/hanwha_mdbtools.py`**: lists tables, exports a table via `mdb-export`, parses **`PART_Det`** → `PARTNAME` / profile / description (requires **mdbtools** on `PATH`).
+- New tab **Machine lib**: open `.mdb`, show table list summary and **PART_Det** in a read-only table (`machine_library_tab.py`).
+- **Hanwha MDB editor** (`src/hanwha_mdb_edit/`): Join **PART_Det** with **PROFILE_Det** (PARENTPROFILE / BASE, UPDPARTGROUPID), **PROFILECOMDATA_Det** (FEEDINGSPEEDLEVEL), **Q_HANDDATA_Det** (OVERALL_SPEED_LEVEL); **PART_Det** includes **VENDORID**. Bulk dialogs for base profile and speed levels; save emits four CSV sidecars + optional Windows ODBC updates.
+- Tests: `tests/test_hanwha_mdbtools.py` + fixture `tests/fixtures/hanwha_PART_Det_sample.csv`; optional integration tests when `UPD.MDB` sits next to the `boomer/` folder.
+- Doc: `doc/hanwha_UPD_mdb_schema.md`, `doc/hanwha_mdb_editor.md`.
 
 ### Summary
 

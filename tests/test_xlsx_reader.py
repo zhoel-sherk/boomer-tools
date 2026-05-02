@@ -17,7 +17,7 @@ def test_no_file():
 
 def test_bom():
     grid = xlsx_reader.read_xlsx_sheet(f"{tests_path}/assets/bom.xlsx")
-    assert grid.nrows == 22-1 # skip lines with empty column A
+    assert grid.nrows == 22  # rows with ≥4 populated leading cells kept (see __check_row_valid)
     assert grid.ncols == 8
     assert grid.rows_raw()[-1][3] == "MURA-BLM18PG_KG-CHIP-2_V1"
     # check if empty cell was appended

@@ -1,4 +1,4 @@
-# Boomer Tools (WIP)
+# Boomer Tools — **ALPHA v0.1.0**
 
 Boomer Tools is an active fork of the original Boomer BOM/PnP comparator.
 
@@ -17,6 +17,10 @@ python src/app_pyside6.py
 
 Legacy desktop entrypoints and web prototypes were removed from this fork. Future web work should be rebuilt on top of shared core services after the desktop workflow is stable.
 
+**ALPHA:** Expect rough edges. The main window shows a **Work in progress** strip; Hanwha MDB edit and PCB Preview are especially experimental. `QSettings` uses organization **`Boomer`** / application **`BoomerTools`** — settings saved under the old **`BoomerPySide6`** app name are **not** migrated.
+
+**UI profiles:** On the Project tab you can pick a **profile** (`default` or cloned names). Checkboxes, combos, and tab options for BOM/PnP (except which file is open), Clean, Merge, Report, and PCB Preview **mirror/units/nudge** are saved into the active profile when you **close the app**. **Loaded BOM/PnP file paths are not restored** after restart (hash-keyed options still apply when you open the same path again). Use **Clear** on the BOM or PnP tab to unload a file from the workspace without changing saved profile defaults.
+
 ### PCB Preview (work in progress)
 
 The PySide6 app includes a **PCB Preview** tab: Gerber layers via [gerbonara](https://pypi.org/project/gerbonara/), overlay of the current PnP table, zoom/pan, optional KiCad `.kicad_mod` outlines, placement labels, mirror X/Y, and a mm **nudge** control. This is **Gerber visualization only** — separate from machine-library work below.
@@ -25,11 +29,9 @@ The PySide6 app includes a **PCB Preview** tab: Gerber layers via [gerbonara](ht
 
 Matching cleaned **Merge** output to real pick-and-place **machine component names** will live in a dedicated desktop area, backed by **Qt-free** parsers/services (same split as `src/pcb_preview/`: no business logic stuck in `app_pyside6.py`).
 
-- **Yamaha (first target):** `.Tou` and `DevLibEd*.Lib`. Use [yedytor](https://github.com/marmidr/yedytor) (MIT) as a **reference for formats and matching ideas**, not as a CustomTkinter UI port. Concrete steps: [TODO.md](TODO.md) → Phase 5 and **Yedytor / Yamaha**.
+- **Hanwha / Samsung (current focus, WIP):** shop libraries are often **Microsoft Access `.mdb`**. The **Machine lib** tab lists tables and **`PART_Det`** (`PARTNAME`). Separate **Hanwha MDB editor** (`src/hanwha_mdb_edit/`) joins profiles and can autosave/recover edited grids like BOM/PnP. See `doc/hanwha_UPD_mdb_schema.md`, `doc/hanwha_mdb_editor.md`, and `doc/machine_lib_yedytor_notes.md`. Linux: **mdbtools**; Windows: optional **ODBC** / `pyodbc` for in-place updates.
 
-- **Hanwha (later):** shop libraries are often **Microsoft Access `.mdb`**. Import is planned **after** small sanitized **sample `.mdb`** fixtures exist. Access strategy will be platform-dependent, for example:
-  - Windows: **ODBC** (e.g. `pyodbc` + Microsoft Access driver) where the driver is available;
-  - Linux: **[mdbtools](https://github.com/mdbtools/mdbtools)** (`mdb-sql` / exports) or a **CSV dump** from the placement software if direct reads are fragile.
+- **Yamaha (second):** `.Tou` and `DevLibEd*.Lib`. Use [yedytor](https://github.com/marmidr/yedytor) (MIT) as a **reference for formats and UX patterns** — vendor a clone under [`yedytor/`](yedytor/README.md) when convenient. Phase 5 details: [TODO.md](TODO.md).
 
 Both vendors should converge on the **same normalized machine-component model** (search, MRU, auto-match, export checks) described in [TODO.md](TODO.md) Phase 5.
 
@@ -43,7 +45,7 @@ The project is actively evolving. See:
 
 ### BOM / PnP Loading
 
-- Load BOM and PnP files into editable tables.
+- Load BOM and PnP files into editable tables; **Clear** unloads the current file from the tab (empty table, mapping cleared).
 - Supported formats:
   - `.xls`
   - `.xlsx`
@@ -168,13 +170,18 @@ python src/app_pyside6.py
 
 ## Tests
 
-Install dependencies first:
+From the `boomer` directory, activate the venv and run pytest with `PYTHONPATH=src` so imports resolve (`csv_reader`, `cross_check`, …).
 
 ```bash
+cd boomer
+source .venv/bin/activate
+export PYTHONPATH=src
 python -m pip install -r requirements.txt
 ```
 
-Targeted working-path checks used during the current cleanup:
+`tests/conftest.py` sets `QT_QPA_PLATFORM=offscreen` before any PySide6 import so the suite does not require a display (CI / SSH). You can set it explicitly if you run a single Qt test file outside pytest.
+
+Targeted checks used during cleanup:
 
 ```bash
 python -m pytest \
@@ -187,27 +194,23 @@ python -m pytest \
   -q
 ```
 
-Recent targeted result:
-
-```text
-41 passed, 3 skipped, 2 failed
-```
-
-The two targeted failures are known `example6` fixture/shape checks. The supplier BOM fixture is currently read as 6 columns while those tests expect column index `8`.
-
 Full suite:
 
 ```bash
 python -m pytest tests -q
 ```
 
-Current full-suite status:
+Last run in project `.venv`: **104 passed, 4 skipped** (counts drift if code/deps change).
 
-```text
-64 passed, 4 skipped, 9 failed
-```
+### Why tests used to fail
 
-Known failures are tracked in [TODO.md](TODO.md). They are mostly legacy reader/test expectation mismatches and old `cross_check.compare()` signature assumptions.
+1. **`cross_check.compare`** gained parameters `(min_distance, coord_unit_mils)`; `tests/test_cross_check.py` still called the old two-argument form → `TypeError`.
+2. **Grid readers** (`csv` / `xlsx` / `xls` / `ods`) filter rows with `__check_row_valid` (need enough columns and non-empty leading cells). The **fixture files** under `tests/assets/` are small or evolved; expectations such as «12−3 rows» or «skip empty column A» no longer matched actual row counts — assertions were updated to match current files.
+3. **example6** supplier BOM (`examples/example6/original_gen3_bom.xlsx`, sheet `abmq601`) was **reshaped** (fewer columns; designator groups live next to «插件位置» in column 5). Tests still read designators from column 8 → empty map and golden mismatch. Helper `_load_example6_abmq601_comment_map()` now follows the new layout.
+
+After aligning tests with the API and fixtures, the full suite should be green in a proper venv (see command above).
+
+Known gaps are listed in [TODO.md](TODO.md) if new failures appear after dependency upgrades.
 
 ## Repository Notes
 

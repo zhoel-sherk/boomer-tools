@@ -1,17 +1,19 @@
 """
-SMT Data Processor - Изолированное ядро для обработки BOM/PnP данных.
+SMT Data Processor — GUI-free core for BOM / Pick-and-Place data.
 
-Модуль не содержит GUI зависимостей, работает только с pandas DataFrame.
-Принимает пути к файлам или DataFrame, возвращает DataFrame с результатами.
+No GUI dependencies; works with pandas DataFrame only.
+Accepts file paths or DataFrames and returns result DataFrames.
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 import re
 import datetime
+
+from pnp_coord import strip_trailing_coord_units
 
 
 # ==============================================================================
@@ -19,27 +21,27 @@ import datetime
 # ==============================================================================
 
 class SMTProcessorError(Exception):
-    """Базовое исключение для SMT Processor"""
+    """Base exception for the SMT processor."""
     pass
 
 
 class SMTFileNotFoundError(SMTProcessorError):
-    """Файл не найден"""
+    """File not found."""
     pass
 
 
 class SMTSheetNotFoundError(SMTProcessorError):
-    """Лист в Excel файле не найден"""
+    """Spreadsheet sheet not found."""
     pass
 
 
 class SMTColumnNotFoundError(SMTProcessorError):
-    """Требуемая колонка не найдена"""
+    """Required column not found."""
     pass
 
 
 class SMTEmptyDataError(SMTProcessorError):
-    """Данные пустые или отсутствуют"""
+    """Data is empty or missing."""
     pass
 
 
@@ -49,24 +51,25 @@ class SMTEmptyDataError(SMTProcessorError):
 
 @dataclass
 class ColumnConfig:
-    """Конфигурация колонок для обработки"""
+    """Column mapping configuration."""
+
     designator: str = "?"
     comment: str = "?"
-    # PnP дополнительные
+    # Extra PnP columns
     footprint: str = "?"
     coord_x: str = "?"
     coord_y: str = "?"
     rotation: str = "?"
     layer: str = "?"
     first_row: int = 0  # 0-based
-    last_row: int = -1  # -1 = все строки
+    last_row: int = -1  # -1 = all rows
     has_header: bool = True
     separator: str = ","
 
 
 @dataclass
 class CrossCheckResult:
-    """Результат cross-check"""
+    """Single cross-check finding."""
     designator: str
     issue_type: str  # "missing_in_bom", "missing_in_pnp", "mismatch", "duplicate_coord"
     bom_value: Optional[str] = None
@@ -79,12 +82,13 @@ class CrossCheckResult:
 
 @dataclass
 class ProcessorConfig:
-    """Глобальная конфигурация процессора"""
+    """Global processor options."""
     # Overlap: centers closer than this (mm) on the same layer; O(n²) on PnP size — disable for dense boards.
     min_distance_mm: float = 3.0
     check_overlap: bool = False
-    coord_unit_mils: bool = True  # True = mm, False = mils
-    normalize_comments: bool = False  # нормализация comment перед сравнением
+    # When overlap check runs: True = PnP X/Y already in mm vs threshold; False = X/Y in mils (convert with ×0.0254 for distance only).
+    overlap_xy_are_mm: bool = True
+    normalize_comments: bool = False  # normalize BOM/PnP comment text before compare
     # Optional callback (message, level) e.g. GUI log; safe from worker thread if level uses Qt::QueuedConnection.
     progress_log: Optional[Callable[[str, str], None]] = field(default=None, repr=False)
 
@@ -93,28 +97,77 @@ class ProcessorConfig:
             self.progress_log(message, level)
 
 
+def coord_cell_float_for_math(value: object) -> Optional[float]:
+    """Numeric magnitude from a cell: strip trailing mil/mm only, then parse digits (no mm↔mil scaling)."""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return float(int(value))
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    s = strip_trailing_coord_units(str(value).strip())
+    if not s:
+        return None
+    s = re.sub(r"[^\d.,\-]", "", s.replace(" ", ""))
+    if not s or s == "-":
+        return None
+    last_dot = s.rfind(".")
+    last_comma = s.rfind(",")
+    dec_pos = max(last_dot, last_comma)
+    if dec_pos != -1:
+        int_part = s[:dec_pos].replace(".", "").replace(",", "")
+        frac_part = s[dec_pos + 1 :].replace(".", "").replace(",", "")
+        if frac_part:
+            s = f"{int_part}.{frac_part}"
+        else:
+            s = int_part
+    try:
+        return float(s.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def merge_coordinate_cell(value: object) -> float:
+    """Merge output X/Y: same magnitude as source after trailing unit strip + numeric parse (no rounding)."""
+    v = coord_cell_float_for_math(value)
+    return np.nan if v is None else float(v)
+
+
 # ==============================================================================
 # File Readers
 # ==============================================================================
 
-def read_file(path: str, sheet_name: Optional[str] = None, first_row: int = 0, last_row: int = -1, separator: Optional[str] = None) -> pd.DataFrame:
+def read_file(
+    path: str,
+    sheet_name: Optional[str] = None,
+    first_row: int = 0,
+    last_row: int = -1,
+    separator: Optional[str] = None,
+    *,
+    column_headers_from_file: bool = True,
+) -> pd.DataFrame:
     """
-    Универсальный ридер файлов BOM/PnP.
-    
+    Load BOM or PnP from a supported file format.
+
     Args:
-        path: Путь к файлу (.xlsx, .xls, .csv, .ods)
-        sheet_name: Имя листа (для Excel/ODS). Если None - первый лист.
-        first_row: Индекс первой строки с данными (0-based)
-        last_row: Индекс последней строки (-1 = все строки)
-        separator: Разделитель для CSV (None = auto)
-    
+        path: File path (.xlsx, .xls, .csv, .ods).
+        sheet_name: Sheet name for Excel/ODS; None = first sheet.
+        first_row: First data row index (0-based, inclusive). GUI "First row" line F is passed as F - 1.
+        last_row: Last data row index (0-based, inclusive). GUI "Last row" line L is passed as L - 1; -1 = through end.
+        separator: CSV delimiter; None = auto.
+        column_headers_from_file: If False (GUI preview), the first row of the sheet/file is kept as
+            data and columns are renamed to "0", "1", … after trimming. If True (default),
+            CSV/Excel use the first row as column names as before.
+
     Returns:
         pandas.DataFrame
-    
+
     Raises:
-        SMTFileNotFoundError: Файл не найден
-        SMTSheetNotFoundError: Лист не найден
-        SMTEmptyDataError: Файл пустой
+        SMTFileNotFoundError: Path does not exist.
+        SMTSheetNotFoundError: Named sheet missing.
+        SMTEmptyDataError: No usable rows.
     """
     path_obj = Path(path)
     
@@ -125,13 +178,13 @@ def read_file(path: str, sheet_name: Optional[str] = None, first_row: int = 0, l
     df: pd.DataFrame
     
     if suffix in ['.xlsx', '.xls']:
-        df = _read_excel(path, sheet_name)
+        df = _read_excel(path, sheet_name, column_headers_from_file=column_headers_from_file)
     elif suffix in ['.csv', '.txt', '.tab']:
         if separator == "spaces":
             raise SMTProcessorError(
                 "Separator 'spaces' (classic SPACES/*sp) is applied in the GUI only: "
-                "it uses read_text_whitespace_sp() and optional apply_row_as_column_header(). "
-                "Call those from code, or use read_file() with another separator."
+                "it uses read_text_whitespace_sp() then the same first/last row trimming as read_file(). "
+                "Call read_text_whitespace_sp from code, or use read_file() with another separator."
             )
         sep_value = None
         if separator and separator != "auto":
@@ -143,25 +196,34 @@ def read_file(path: str, sheet_name: Optional[str] = None, first_row: int = 0, l
                 sep_value = " "
             else:
                 sep_value = separator
-        df = _read_csv(path, separator=sep_value)
+        df = _read_csv(path, separator=sep_value, column_headers_from_file=column_headers_from_file)
     elif suffix == '.ods':
-        df = _read_ods(path, sheet_name)
+        df = _read_ods(path, sheet_name, column_headers_from_file=column_headers_from_file)
     else:
         raise SMTProcessorError(f"Unsupported file format: {suffix}")
     
-    # Очистка пустых строк
+    # Drop blank rows
     df = _clean_empty_rows(df)
     
     if df.empty:
         raise SMTEmptyDataError(f"File is empty or has no valid rows: {path}")
     
-    # Применяем first_row если указан
-    if first_row > 0 and first_row < len(df):
-        df = df.iloc[first_row:].reset_index(drop=True)
-    
-    # Применяем last_row если указан
-    if last_row > 0 and last_row < len(df):
-        df = df.iloc[:last_row].reset_index(drop=True)
+    # Row range: inclusive 0-based indices (matches GUI First row / Last row as 1-based inclusive lines).
+    if first_row < 0:
+        first_row = 0
+    if first_row >= len(df):
+        df = df.iloc[0:0].copy()
+    elif last_row < 0:
+        df = df.iloc[first_row:].copy().reset_index(drop=True)
+    elif last_row < first_row:
+        df = df.iloc[0:0].copy()
+    else:
+        end = min(last_row + 1, len(df))
+        df = df.iloc[first_row:end].copy().reset_index(drop=True)
+
+    if not column_headers_from_file and len(df.columns) > 0:
+        df = df.copy()
+        df.columns = [str(i) for i in range(len(df.columns))]
     
     return df
 
@@ -182,14 +244,21 @@ def _drop_fully_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep].copy()
 
 
-def _read_excel(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-    """Читает Excel файл - специальная обработка для китайских форматов BOM"""
+def _read_excel(
+    path: str, sheet_name: Optional[str] = None, *, column_headers_from_file: bool = True
+) -> pd.DataFrame:
+    """Read Excel with extra handling for some Chinese BOM layouts."""
     try:
         suffix = Path(path).suffix.lower()
         engine = "xlrd" if suffix == ".xls" else "openpyxl"
         # Open file and get first sheet
         xls = pd.ExcelFile(path, engine=engine)
         sheet = sheet_name if sheet_name else xls.sheet_names[0]
+
+        if not column_headers_from_file:
+            df = pd.read_excel(xls, sheet_name=sheet, header=None)
+            df = _drop_fully_empty_columns(df)
+            return df
         
         # First read to check structure
         df = pd.read_excel(xls, sheet_name=sheet)
@@ -210,7 +279,7 @@ def _read_excel(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
         # Some vendor exports are plain text/CSV with a misleading Excel extension.
         # Try the robust text reader before giving up, so users can still import data.
         try:
-            return _read_csv(path, separator=None)
+            return _read_csv(path, separator=None, column_headers_from_file=column_headers_from_file)
         except Exception:
             raise SMTProcessorError(
                 f"Cannot read Excel file: {e}. "
@@ -279,8 +348,9 @@ def _unique_dataframe_column_names(raw: list[str]) -> list[str]:
 def read_text_whitespace_sp(path: str) -> pd.DataFrame:
     """
     Classic Boomer SPACES (Profile SPACES / *sp): use str.split() on each line.
-    Same validation and quoting as csv_reader for delim '*sp'. Does not set header row;
-    use apply_row_as_header() when Has headers + 1st points at that row.
+    Same validation and quoting as csv_reader for delim '*sp'. Column names are numeric strings
+    (0, 1, …). The GUI loads the full grid and trims with First/Last row like ``read_file``;
+    it does not promote a row into headers (preview keeps every data row).
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -321,8 +391,14 @@ def apply_row_as_column_header(df: pd.DataFrame, row_index: int) -> pd.DataFrame
     return out.reset_index(drop=True)
 
 
-def _read_csv(path: str, separator: Optional[str] = None, skip_meta: bool = True) -> pd.DataFrame:
-    """Читает CSV файл с автоопределением разделителя и пропуском метаданных"""
+def _read_csv(
+    path: str,
+    separator: Optional[str] = None,
+    skip_meta: bool = True,
+    *,
+    column_headers_from_file: bool = True,
+) -> pd.DataFrame:
+    """Read CSV with auto delimiter detection and metadata skip."""
     # Handle special separators
     if separator in ("2+sp", "fixed"):
         return _read_fixed_width(path, 0)  # Use read_file(..., first_row=) to skip Board/header lines
@@ -341,19 +417,41 @@ def _read_csv(path: str, separator: Optional[str] = None, skip_meta: bool = True
     # Auto-detect separator
     if separator is None:
         separator = _detect_delimiter(path)
-    
+
+    hdr = 0 if column_headers_from_file else None
     try:
-        df = pd.read_csv(path, sep=separator, encoding='utf-8', skiprows=start_row, on_bad_lines='skip')
+        df = pd.read_csv(
+            path,
+            sep=separator,
+            encoding='utf-8',
+            skiprows=start_row,
+            header=hdr,
+            on_bad_lines='skip',
+        )
     except (UnicodeDecodeError, pd.errors.ParserError):
         try:
-            df = pd.read_csv(path, sep=separator, encoding='latin-1', skiprows=start_row, on_bad_lines='skip')
-        except:
-            df = pd.read_csv(path, sep='\t', encoding='utf-8', skiprows=start_row, on_bad_lines='skip')
+            df = pd.read_csv(
+                path,
+                sep=separator,
+                encoding='latin-1',
+                skiprows=start_row,
+                header=hdr,
+                on_bad_lines='skip',
+            )
+        except Exception:
+            df = pd.read_csv(
+                path,
+                sep='\t',
+                encoding='utf-8',
+                skiprows=start_row,
+                header=hdr,
+                on_bad_lines='skip',
+            )
     return df
 
 
 def _is_fixed_width(path: str, start_row: int) -> bool:
-    """Определяет fixed-width формат по наличию множественных пробелов"""
+    """Heuristic: fixed-width when multiple runs of spaces appear."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             head = "".join(f.readline() for _ in range(24))
@@ -381,7 +479,7 @@ def _is_fixed_width(path: str, start_row: int) -> bool:
 
 
 def _read_fixed_width(path: str, start_row: int) -> pd.DataFrame:
-    """Читает fixed-width формат - split by 2+ spaces"""
+    """Read fixed-width rows split on 2+ spaces."""
     import re
     
     try:
@@ -492,7 +590,7 @@ def _read_fixed_width(path: str, start_row: int) -> pd.DataFrame:
 
 
 def _detect_delimiter(path: str) -> str:
-    """Автоматически определяет разделитель в CSV"""
+    """Guess the dominant CSV delimiter."""
     try:
         with open(path, 'r', encoding='utf-8') as f:
             first_lines = [f.readline() for _ in range(15)]
@@ -500,20 +598,20 @@ def _detect_delimiter(path: str) -> str:
         with open(path, 'r', encoding='latin-1') as f:
             first_lines = [f.readline() for _ in range(15)]
     
-    # Считаем разделители
+    # Count delimiter occurrences
     separators = {',': 0, ';': 0, '\t': 0, '|': 0}
     for line in first_lines:
         for sep in separators:
             separators[sep] += line.count(sep)
     
-    # Возвращаем самый частый
+    # Return the most frequent
     if max(separators.values()) > 0:
         return max(separators, key=separators.get)
     return ','  # Default
 
 
 def _find_data_start(path: str) -> int:
-    """Находит строку с реальными данными (пропускает метаданные)"""
+    """Find first row that looks like real table data (skip metadata)."""
     try:
         with open(path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
@@ -555,13 +653,16 @@ def _find_data_start(path: str) -> int:
     return 0  # Default
 
 
-def _read_ods(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-    """Читает ODS файл (Open Document Spreadsheet)"""
+def _read_ods(
+    path: str, sheet_name: Optional[str] = None, *, column_headers_from_file: bool = True
+) -> pd.DataFrame:
+    """Read OpenDocument Spreadsheet (.ods)."""
     try:
+        hdr = 0 if column_headers_from_file else None
         if sheet_name:
-            df = pd.read_excel(path, sheet_name=sheet_name, engine='odf')
+            df = pd.read_excel(path, sheet_name=sheet_name, engine='odf', header=hdr)
         else:
-            df = pd.read_excel(path, engine='odf')
+            df = pd.read_excel(path, engine='odf', header=hdr)
     except Exception as e:
         raise SMTProcessorError(f"Cannot read ODS file: {e}")
     return df
@@ -569,16 +670,16 @@ def _read_ods(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
 
 def _clean_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Удаляет строки, где все ячейки пустые илиNaN.
-    Также удаляет строки, начинающиеся с '___'.
+    Drop rows where every cell is empty or NaN.
+    Also drop rows starting with '___'.
     """
     if df.empty:
         return df
     
-    # Удаляем строки где все значения NaN
+    # Drop all-NaN rows
     df = df.dropna(how='all')
     
-    # Удаляем строки начинающиеся с ___ (разделители в Excel)
+    # Drop Excel separator rows starting with ___
     if not df.empty and len(df.columns) > 0:
         first_col = df.columns[0]
         df = df[~df[first_col].astype(str).str.startswith('___')]
@@ -593,9 +694,9 @@ def _clean_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 class SMTDataProcessor:
     """
-    Основной процессор для SMT данных.
+    Main BOM/PnP processor.
     
-    Изолирован от GUI, работает только с pandas.
+    GUI-free; uses pandas only.
     """
     
     def __init__(self, config: Optional[ProcessorConfig] = None):
@@ -611,14 +712,14 @@ class SMTDataProcessor:
     
     def load_bom(self, path: str, config: ColumnConfig) -> "SMTDataProcessor":
         """
-        Загружает BOM файл.
+        Load BOM from file.
         
         Args:
-            path: Путь к файлу BOM
-            config: Конфигурация колонок
+            path: BOM file path
+            config: Column mapping
         
         Returns:
-            self для цепочки вызовов
+            Self for method chaining
         """
         self._bom_df = read_file(path, first_row=config.first_row)
         self._bom_config = config
@@ -626,14 +727,14 @@ class SMTDataProcessor:
     
     def load_pnp(self, path: str, config: ColumnConfig) -> "SMTDataProcessor":
         """
-        Загружает PnP файл.
+        Load PnP from file.
         
         Args:
-            path: Путь к файлу PnP
-            config: Конфигурация колонок
+            path: PnP file path
+            config: Column mapping
         
         Returns:
-            self для цепочки вызовов
+            Self for method chaining
         """
         self._pnp_df = read_file(path, first_row=config.first_row)
         self._pnp_config = config
@@ -642,16 +743,16 @@ class SMTDataProcessor:
     def set_dataframes(self, bom_df: pd.DataFrame, pnp_df: pd.DataFrame,
                      bom_config: ColumnConfig, pnp_config: ColumnConfig) -> "SMTDataProcessor":
         """
-        Устанавливает DataFrame напрямую (минуя загрузку из файла).
+        Set BOM/PnP frames directly (skip file IO).
         
         Args:
-            bom_df: DataFrame с данными BOM
-            pnp_df: DataFrame с данными PnP
-            bom_config: Конфигурация колонок BOM
-            pnp_config: Конфигурация колонок PnP
+            bom_df: BOM table
+            pnp_df: PnP table
+            bom_config: BOM column mapping
+            pnp_config: PnP column mapping
         
         Returns:
-            self для цепочки вызовов
+            Self for method chaining
         """
         self._bom_df = bom_df
         self._pnp_df = pnp_df
@@ -673,32 +774,32 @@ class SMTDataProcessor:
     
     @property
     def bom_columns(self) -> list[str]:
-        """Возвращает список колонок BOM"""
+        """Return BOM column names."""
         if self._bom_df is None:
             return []
         return list(self._bom_df.columns)
     
     @property
     def pnp_columns(self) -> list[str]:
-        """Возвращает список колонок PnP"""
+        """Return PnP column names."""
         if self._pnp_df is None:
             return []
         return list(self._pnp_df.columns)
     
     def find_column_index(self, df: pd.DataFrame, col_identifier: str, has_header: bool = True) -> int:
         """
-        Находит индекс колонки по имени или номеру.
+        Resolve a column index by header name or numeric index.
         
         Args:
-            df: DataFrame для поиска
-            col_identifier: Имя колонки (str) или номер (int)
-            has_header: Есть ли заголовки
+            df: Table to search
+            col_identifier: Column name (str) or index (int)
+            has_header: Whether the table has a header row
         
         Returns:
-            Индекс колонки (0-based)
+            Column index (0-based)
         
         Raises:
-            SMTColumnNotFoundError: Колонка не найдена
+            SMTColumnNotFoundError: Column not found
         """
         # Allow "_skip_" to mean "optional - skip this check"
         if col_identifier == "_skip_" or col_identifier is None:
@@ -707,12 +808,12 @@ class SMTDataProcessor:
         if col_identifier == "?" or col_identifier == "":
             raise SMTColumnNotFoundError(f"Column not specified: {col_identifier}")
         
-        # Если число - возвращаем как индекс
+        # Numeric identifier: treat as column index
         if isinstance(col_identifier, int):
             return col_identifier
         
         if isinstance(col_identifier, str):
-            # Пробуем как номер
+            # Try numeric column index
             try:
                 idx = int(col_identifier)
                 if 0 <= idx < len(df.columns):
@@ -720,16 +821,16 @@ class SMTDataProcessor:
             except ValueError:
                 pass
             
-            # Пробуем как имя (точно или часть)
+            # Try header substring match
             cols = [str(c).strip() if c is not None else "" for c in df.columns]
             col_upper = str(col_identifier).strip().upper()
             
-            # Точное совпадение
+            # Exact header match
             for i, c in enumerate(cols):
                 if c.upper() == col_upper:
                     return i
             
-            # Частичное совпадение
+            # Partial header match
             for i, c in enumerate(cols):
                 if col_upper in c.upper():
                     return i
@@ -742,10 +843,10 @@ class SMTDataProcessor:
     
     def cross_check(self) -> pd.DataFrame:
         """
-        Основной метод: сравнение BOM и PnP.
+        Cross-check BOM vs PnP.
         
         Returns:
-            DataFrame с результатами: 
+            DataFrame of findings: 
             - Designator, IssueType, BOM_Value, PnP_Value, 
             - Footprint, Coord_X, Coord_Y, Severity
         """
@@ -757,7 +858,7 @@ class SMTDataProcessor:
         self.config.emit_progress("Cross-check: resolving column mapping...", "info")
         results: list[CrossCheckResult] = []
         
-        # Находим индексы колонок
+        # Resolve column indices
         bom_config = self._bom_config or ColumnConfig()
         pnp_config = self._pnp_config or ColumnConfig()
         
@@ -773,7 +874,7 @@ class SMTDataProcessor:
         except SMTColumnNotFoundError as e:
             raise SMTColumnNotFoundError(f"PnP configuration error: {e}")
         
-        # Извлекаем данные
+        # Extract series
         self.config.emit_progress("Cross-check: reading BOM and PnP parts...", "info")
         bom_parts = self._extract_bom_parts(bom_designator_idx, bom_comment_idx)
         pnp_parts = self._extract_pnp_parts(pnp_designator_idx, pnp_comment_idx, pnp_config)
@@ -782,7 +883,7 @@ class SMTDataProcessor:
             "info",
         )
         
-        # 1. Проверяем: BOM parts missing in PnP (warning - часто fiducials/разъемы не в BOM)
+        # 1. BOM refs absent from PnP (often OK: fiducials, mechanicals)
         for designator, bom_comment in bom_parts.items():
             if designator and designator not in pnp_parts:
                 results.append(CrossCheckResult(
@@ -790,10 +891,10 @@ class SMTDataProcessor:
                     issue_type="missing_in_pnp",
                     bom_value=bom_comment,
                     pnp_value=None,
-                    severity="warning"  # Warning - может быть нормально
+                    severity="warning"  # May be acceptable
                 ))
         
-        # 2. Проверяем: PnP parts missing in BOM (critical - компонент есть но нет в BOM!)
+        # 2. PnP refs missing from BOM (usually critical)
         for designator, pnp_data in pnp_parts.items():
             if designator and designator not in bom_parts:
                 pnp_comment = pnp_data[0] if pnp_data else None
@@ -802,10 +903,10 @@ class SMTDataProcessor:
                     issue_type="missing_in_bom",
                     bom_value=None,
                     pnp_value=pnp_comment,
-                    severity="critical"  # Critical - реальная проблема
+                    severity="critical"  # Likely real issue
                 ))
         
-        # 3. Проверяем: Comment mismatch
+        # 3. Comment / value mismatch
         for designator in bom_parts:
             if designator in pnp_parts:
                 bom_val = bom_parts[designator]
@@ -817,44 +918,54 @@ class SMTDataProcessor:
                 
                 if bom_val != pnp_val:
                     footprint = pnp_parts[designator][1] if len(pnp_parts[designator]) > 1 else None
-                    coord_xy = pnp_parts[designator][2:] if len(pnp_parts[designator]) > 2 else (None, None)
+                    cx = pnp_parts[designator][2] if len(pnp_parts[designator]) > 2 else None
+                    cy = pnp_parts[designator][3] if len(pnp_parts[designator]) > 3 else None
                     results.append(CrossCheckResult(
                         designator=designator,
                         issue_type="mismatch",
                         bom_value=bom_val,
                         pnp_value=pnp_val,
                         footprint=footprint,
-                        coord_x=coord_xy[0],
-                        coord_y=coord_xy[1],
+                        coord_x=cx,
+                        coord_y=cy,
                         severity="warning"
                     ))
         
-        # 4. Проверяем: Duplicate coordinates (exact match)
-        self.config.emit_progress("Cross-check: duplicate exact coordinates (same X/Y)...", "info")
+        # 4. Duplicate placements (same XY on the **same** layer when Layer is mapped)
+        self.config.emit_progress(
+            "Cross-check: duplicate exact coordinates (same X/Y, same layer)...", "info"
+        )
         coord_map: dict[tuple, list[str]] = {}
         for designator, pnp_data in pnp_parts.items():
             if len(pnp_data) > 2 and pnp_data[2] is not None:
                 try:
                     coord = (float(pnp_data[2]), float(pnp_data[3]) if len(pnp_data) > 3 else 0.0)
                     if coord != (0.0, 0.0):
-                        if coord not in coord_map:
-                            coord_map[coord] = []
-                        coord_map[coord].append(designator)
+                        layer_key = ""
+                        if len(pnp_data) > 4 and pnp_data[4] is not None:
+                            layer_key = str(pnp_data[4]).strip().upper()
+                        loc_key = (layer_key, coord[0], coord[1])
+                        if loc_key not in coord_map:
+                            coord_map[loc_key] = []
+                        coord_map[loc_key].append(designator)
                 except (ValueError, TypeError):
                     pass
         
         dup_pairs = 0
-        for coord, parts in coord_map.items():
-            if len(parts) > 1:
-                for i in range(len(parts)):
-                    for j in range(i + 1, len(parts)):
-                        dup_pairs += 1
-                        results.append(CrossCheckResult(
-                            designator=f"{parts[i]}<->{parts[j]}",
-                            issue_type="duplicate_coord",
-                            pnp_value=f"({coord[0]}, {coord[1]})",
-                            severity="critical"
-                        ))
+        for loc_key, parts in coord_map.items():
+            if len(parts) <= 1:
+                continue
+            layer_k, cx, cy = loc_key
+            layer_disp = layer_k if layer_k else "(layer not mapped)"
+            for i in range(len(parts)):
+                for j in range(i + 1, len(parts)):
+                    dup_pairs += 1
+                    results.append(CrossCheckResult(
+                        designator=f"{parts[i]}<->{parts[j]}",
+                        issue_type="duplicate_coord",
+                        pnp_value=f"({cx}, {cy}) layer={layer_disp}",
+                        severity="critical"
+                    ))
         if dup_pairs:
             self.config.emit_progress(f"Duplicate exact coordinates: {dup_pairs} pair(s)", "info")
 
@@ -866,24 +977,24 @@ class SMTDataProcessor:
                 f"({n} placements — O(n²), can be slow on dense boards)",
                 "info",
             )
-            conflicts = _check_overlapping(pnp_parts, self.config.min_distance_mm, self.config.coord_unit_mils)
+            conflicts = _check_overlapping(pnp_parts, self.config.min_distance_mm, self.config.overlap_xy_are_mm)
             self.config.emit_progress(f"Overlap: {len(conflicts)} pair(s) within threshold", "info")
             for part1, part2, dist in conflicts:
                 results.append(CrossCheckResult(
                     designator=f"{part1} <--> {part2}",
                     issue_type="overlapping",
-                    pnp_value=f"{dist:.1f}mm",
+                    pnp_value=f"{dist}mm",
                     severity="info"
                 ))
         else:
             self.config.emit_progress("Overlap check: off (faster; enable on Report tab if needed)", "info")
 
         self.config.emit_progress("Cross-check: building result table...", "info")
-        # Конвертируем в DataFrame
+        # Build results DataFrame
         return self._results_to_dataframe(results)
     
     def _extract_bom_parts(self, designator_idx: int, comment_idx: int) -> dict[str, str]:
-        """Извлекает компоненты из BOM"""
+        """Collect BOM rows for compare."""
         parts = {}
         
         # Skip if designator_idx is -1
@@ -911,7 +1022,7 @@ class SMTDataProcessor:
     
     def _extract_pnp_parts(self, designator_idx: int, comment_idx: int, 
                          config: ColumnConfig) -> dict[str, tuple]:
-        """Извлекает компоненты из PnP"""
+        """Collect PnP rows for compare."""
         parts = {}
         
         # Skip if designator_idx is -1
@@ -920,8 +1031,8 @@ class SMTDataProcessor:
             
         cols = list(self._pnp_df.columns)
         
-        # Находим дополнительные колонки
-        coord_x_col = coord_y_col = footprint_col = None
+        # Optional extra columns
+        coord_x_col = coord_y_col = footprint_col = layer_col = None
         for c in cols:
             c_upper = str(c).strip().upper()
             if config.coord_x not in ("?", "_skip_", None) and c_upper == str(config.coord_x).strip().upper():
@@ -930,6 +1041,8 @@ class SMTDataProcessor:
                 coord_y_col = c
             if config.footprint not in ("?", "_skip_", None) and c_upper == str(config.footprint).strip().upper():
                 footprint_col = c
+            if config.layer not in ("?", "_skip_", None) and c_upper == str(config.layer).strip().upper():
+                layer_col = c
         
         for _, row in self._pnp_df.iterrows():
             designator_col = cols[designator_idx] if designator_idx < len(cols) else None
@@ -941,44 +1054,31 @@ class SMTDataProcessor:
             designators = str(row[designator_col]).split(',')
             comment = str(row[comment_col]) if comment_col and not pd.isna(row[comment_col]) else ""
             
-            # Координаты
+            # Coordinates
             coord_x = coord_y = None
             if coord_x_col and not pd.isna(row[coord_x_col]):
-                try:
-                    coord_x = self._parse_coord(row[coord_x_col])
-                except:
-                    pass
+                coord_x = coord_cell_float_for_math(row[coord_x_col])
             if coord_y_col and not pd.isna(row[coord_y_col]):
-                try:
-                    coord_y = self._parse_coord(row[coord_y_col])
-                except:
-                    pass
+                coord_y = coord_cell_float_for_math(row[coord_y_col])
             
             # Footprint
             footprint = None
             if footprint_col and not pd.isna(row[footprint_col]):
                 footprint = str(row[footprint_col])
+
+            layer = None
+            if layer_col and not pd.isna(row[layer_col]):
+                layer = str(row[layer_col])
             
             for d in designators:
                 d = d.strip()
                 if d:
-                    parts[d] = (comment, footprint, coord_x, coord_y)
+                    parts[d] = (comment, footprint, coord_x, coord_y, layer)
         
         return parts
     
-    def _parse_coord(self, value) -> Optional[float]:
-        """Парсит координату в число"""
-        if value is None or pd.isna(value):
-            return None
-        s = str(value)
-        s = re.sub(r'[^\d.,\-]', '', s)
-        try:
-            return float(s)
-        except ValueError:
-            return None
-    
     def _results_to_dataframe(self, results: list[CrossCheckResult]) -> pd.DataFrame:
-        """Конвертирует результаты в DataFrame"""
+        """Convert issue list to DataFrame."""
         if not results:
             return pd.DataFrame(columns=[
                 "Designator", "IssueType", "BOM_Value", "PnP_Value", 
@@ -1006,13 +1106,13 @@ class SMTDataProcessor:
     
     def merge_bom_pnp(self, include_dnp: bool = True) -> pd.DataFrame:
         """
-        Объединяет BOM и PnP данные.
+        Merge BOM and PnP into one placement table.
         
         Args:
-            include_dnp: Включать ли компоненты со значением "DNP"
+            include_dnp: Keep placements marked DNP
         
         Returns:
-            DataFrame с колонками: Ref, Value, Footprint, X, Y, Rotation, Layer
+            DataFrame columns: Ref, Value, Footprint, X, Y, Rotation, Layer
         """
         if self._bom_df is None or self._pnp_df is None:
             raise SMTEmptyDataError("Both BOM and PnP must be loaded")
@@ -1020,7 +1120,7 @@ class SMTDataProcessor:
         bom_config = self._bom_config or ColumnConfig()
         pnp_config = self._pnp_config or ColumnConfig()
         
-        # Имена колонок
+        # Resolved column names
         bom_cols = list(self._bom_df.columns)
         pnp_cols = list(self._pnp_df.columns)
         
@@ -1040,7 +1140,7 @@ class SMTDataProcessor:
             if pnp_config.comment != "?" and c_upper == str(pnp_config.comment).strip().upper():
                 pnp_comment_col = c
         
-        # PnP дополнительные колонки
+        # Extra PnP columns
         pnp_x_col = pnp_y_col = pnp_rot_col = pnp_layer_col = pnp_fp_col = None
         for c in pnp_cols:
             c_upper = str(c).strip().upper()
@@ -1070,10 +1170,9 @@ class SMTDataProcessor:
                 if d:
                     bom_map[_ref_key(d)] = comment
         
-        # Создаем результат
+        # Build merged frame
         merged = []
-        coord_mult = 25.4 if self.config.coord_unit_mils else 1.0
-        
+
         for _, row in self._pnp_df.iterrows():
             if pnp_designator_col is None or pd.isna(row[pnp_designator_col]):
                 continue
@@ -1097,18 +1196,9 @@ class SMTDataProcessor:
             if not include_dnp and str(value).strip().upper() in ["DNP", "DNP_FROM_BOM"]:
                 continue
             
-            # Coordinates
-            x = y = 0.0
-            try:
-                if pnp_x_col and not pd.isna(row[pnp_x_col]):
-                    x = float(self._parse_coord(row[pnp_x_col]) or 0) * coord_mult
-            except:
-                pass
-            try:
-                if pnp_y_col and not pd.isna(row[pnp_y_col]):
-                    y = float(self._parse_coord(row[pnp_y_col]) or 0) * coord_mult
-            except:
-                pass
+            # Coordinates — same magnitude as source (only trailing mil/mm stripped during parse).
+            x = merge_coordinate_cell(row[pnp_x_col]) if pnp_x_col and not pd.isna(row[pnp_x_col]) else np.nan
+            y = merge_coordinate_cell(row[pnp_y_col]) if pnp_y_col and not pd.isna(row[pnp_y_col]) else np.nan
             
             # Rotation
             rotation = ""
@@ -1129,8 +1219,8 @@ class SMTDataProcessor:
                 "Ref": ref,
                 "Value": value,
                 "Footprint": footprint,
-                "X": round(x, 3),
-                "Y": round(y, 3),
+                "X": x,
+                "Y": y,
                 "Rotation": rotation,
                 "Layer": layer
             })
@@ -1138,11 +1228,11 @@ class SMTDataProcessor:
         return pd.DataFrame(merged)
     
     def export_csv(self, df: pd.DataFrame, path: str) -> None:
-        """Экспорт DataFrame в CSV"""
+        """Export DataFrame to CSV text."""
         df.to_csv(path, index=False, encoding='utf-8')
     
     def export_excel(self, df: pd.DataFrame, path: str) -> None:
-        """Экспорт DataFrame в Excel"""
+        """Export DataFrame to Excel."""
         df.to_excel(path, index=False, engine='openpyxl')
 
 
@@ -1152,13 +1242,13 @@ class SMTDataProcessor:
 
 def _normalize_comment(comment: str) -> str:
     """
-    Нормализует комментарий для сравнения.
-    Обрезает после первого разделителя (, или |).
+    Normalize comment text for comparison.
+    Truncate after first comma or pipe.
     """
     if not comment:
         return ""
     comment = str(comment).strip()
-    # Обрезаем после первой запятой или вертикальной черты
+    # Cut at first comma or vertical bar
     if ',' in comment:
         comment = comment.split(',')[0]
     if '|' in comment:
@@ -1166,58 +1256,74 @@ def _normalize_comment(comment: str) -> str:
     return comment.strip()
 
 
-def _check_overlapping(pnp_parts: dict, min_distance: float, unit_is_mils: bool) -> list[tuple]:
+def _check_overlapping(pnp_parts: dict, min_distance_mm: float, overlap_xy_are_mm: bool) -> list[tuple]:
     """
-    Проверяет компоненты на перекрытие.
-    
-    Returns:
-        Список (part1, part2, distance)
+    Pairwise center distances below ``min_distance_mm`` (always interpreted as millimeters).
+
+    ``overlap_xy_are_mm``: True when raw PnP X/Y are already mm; False when they are mils
+    (converted with ×0.0254 **only** for this distance comparison — stored data unchanged).
     """
     import math
-    
+
+    def raw_xy_to_mm(xv: object, yv: object) -> Optional[Tuple[float, float]]:
+        if xv is None or yv is None:
+            return None
+        try:
+            fx = float(xv)
+            fy = float(yv)
+        except (TypeError, ValueError):
+            return None
+        if not overlap_xy_are_mm:
+            fx *= 0.0254
+            fy *= 0.0254
+        return (fx, fy)
+
     conflicts = []
-    decoded_coords: dict[str, tuple] = {}
-    checked: dict[str, list] = {}
-    
+    decoded_coords: dict[str, Tuple[float, float]] = {}
+    checked: dict[str, list[str]] = {}
+
     for key_a in pnp_parts:
         for key_b in pnp_parts:
             if key_a == key_b:
                 continue
-            
-            # Уже проверяли?
+
             if key_a in checked.get(key_b, []):
                 continue
             if key_b not in checked:
                 checked[key_b] = []
             checked[key_b].append(key_a)
-            
-            # Одинаковый слой?
+
             pnp_data_a = pnp_parts.get(key_a, ())
             pnp_data_b = pnp_parts.get(key_b, ())
-            layer_a = pnp_data_a[2] if len(pnp_data_a) > 2 else None
-            layer_b = pnp_data_b[2] if len(pnp_data_b) > 2 else None
-            
+            layer_a = pnp_data_a[4] if len(pnp_data_a) > 4 else None
+            layer_b = pnp_data_b[4] if len(pnp_data_b) > 4 else None
+            if layer_a is not None and layer_b is not None:
+                if str(layer_a).strip().upper() != str(layer_b).strip().upper():
+                    continue
+
             coord_a = decoded_coords.get(key_a)
-            if not coord_a and len(pnp_data_a) > 2 and pnp_data_a[2] is not None:
-                try:
-                    coord_a = (float(pnp_data_a[2] or 0), float(pnp_data_a[3] or 0) if len(pnp_data_a) > 3 else 0.0)
+            if not coord_a and len(pnp_data_a) > 3 and pnp_data_a[2] is not None:
+                mm = raw_xy_to_mm(pnp_data_a[2], pnp_data_a[3])
+                if mm:
+                    coord_a = mm
                     decoded_coords[key_a] = coord_a
-                except:
+                else:
                     continue
-            
+
             coord_b = decoded_coords.get(key_b)
-            if not coord_b and len(pnp_data_b) > 2 and pnp_data_b[2] is not None:
-                try:
-                    coord_b = (float(pnp_data_b[2] or 0), float(pnp_data_b[3] or 0) if len(pnp_data_b) > 3 else 0.0)
+            if not coord_b and len(pnp_data_b) > 3 and pnp_data_b[2] is not None:
+                mm = raw_xy_to_mm(pnp_data_b[2], pnp_data_b[3])
+                if mm:
+                    coord_b = mm
                     decoded_coords[key_b] = coord_b
-                except:
+                else:
                     continue
-            
+
             if coord_a and coord_b:
-                dist = math.sqrt((coord_a[0] - coord_b[0])**2 + (coord_a[1] - coord_b[1])**2)
-                if 0 < dist < min_distance:
-                    conflicts.append((key_a, key_b, round(dist, 1)))
-    
+                dist = math.hypot(coord_a[0] - coord_b[0], coord_a[1] - coord_b[1])
+                if 0 < dist < min_distance_mm:
+                    conflicts.append((key_a, key_b, dist))
+
     return conflicts
 
 
@@ -1226,7 +1332,7 @@ def _check_overlapping(pnp_parts: dict, min_distance: float, unit_is_mils: bool)
 # ==============================================================================
 
 def load_bom(path: str, **kwargs) -> pd.DataFrame:
-    """Быстрая загрузка BOM"""
+    """Convenience: load BOM via read_file."""
     config = ColumnConfig(
         designator=kwargs.get('designator', '?'),
         comment=kwargs.get('comment', '?'),
@@ -1237,7 +1343,7 @@ def load_bom(path: str, **kwargs) -> pd.DataFrame:
 
 
 def load_pnp(path: str, **kwargs) -> pd.DataFrame:
-    """Быстрая загрузка PnP"""
+    """Convenience: load PnP via read_file."""
     config = ColumnConfig(
         designator=kwargs.get('designator', '?'),
         comment=kwargs.get('comment', '?'),

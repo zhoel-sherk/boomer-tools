@@ -21,30 +21,33 @@ def _example6_xlsx_paths() -> tuple[str, str]:
 
 def _load_example6_abmq601_comment_map():
     """
-    Build def (插件位置) -> Comment string as col2+col3 joined by '+' from abmq601.
-    Data rows start at index 4 (0-based) after the Chinese header block.
+    Build ``def`` string (как в колонке ``def`` в bom_final.xlsx) -> Comment как col0+col1
+    через '+', по строкам листа abmq601, где метка «插件位置» и список позиций в колонке 5.
+
+    Формат исходного XLSX менялся: раньше позиции были в колонке 9, сейчас — широкая
+    таблица с группировкой в col5.
     """
     pd = pytest.importorskip("pandas")
     pytest.importorskip("openpyxl")
     orig_path, _ = _example6_xlsx_paths()
     orig = pd.read_excel(orig_path, sheet_name="abmq601", header=None, engine="openpyxl")
     dmap: dict[str, str] = {}
-    for i in range(4, len(orig)):
+    for i in range(len(orig)):
         row = orig.iloc[i]
-        de = row[8]
-        if de is None or (isinstance(de, float) and str(de) == "nan"):
+        label = row[4]
+        placements = row[5]
+        if pd.isna(label) or "插件位置" not in str(label):
             continue
-        sdef = str(de).strip()
-        if not sdef:
+        if pd.isna(placements) or not str(placements).strip():
             continue
-        c2, c3 = row[2], row[3]
+        key = str(placements).strip()
         parts: list[str] = []
-        for x in (c2, c3):
+        for x in (row[0], row[1]):
             if x is not None and not (isinstance(x, float) and str(x) == "nan"):
                 t = str(x).strip()
                 if t:
                     parts.append(t)
-        dmap[sdef] = "+".join(parts)
+        dmap[key] = "+".join(parts)
     return dmap
 
 
@@ -159,18 +162,44 @@ def test_inferit_res_cap_ind_regex_presets():
     assert cap[0] == "0402_10pF_50V_NPO_5%"
 
     ind = clean_component.clean_one(
-        "SMD-INDUCTOR 4.45*4.05*1.2mm 1.0uH ±20% 47mΩMax 4.5A SMD LEAD-FREE - 092",
+        "SMD-INDUCTOR 4.45*4.05*1.2mm 1.0uH ±20% 47mΩMax 4.5A SMD LEAD-FREE - 092(STPI0412-1R0M-T2)",
         cfg,
     )
     assert ind[2] == "IND"
-    assert ind[0] == "1.0uH_4.5A_20%"
+    assert ind[0] == "0412_1.0uH_20%_4.5A_47mΩ"
 
     bead = clean_component.clean_one(
         "FERRITE-BEAD 0402 120 OHM@100MHz ±25% 700mA LEAD-FREE - 309",
         cfg,
     )
     assert bead[2] == "IND"
-    assert bead[0] == "0402_120R@100MHZ_700MA_25%"
+    assert bead[0] == "0402_120R@100MHZ_25%_700MA"
+
+
+def test_inductor_group_off_uses_other_regex_path():
+    cfg = clean_component.CleanConfig(
+        parse_inductors=False,
+        use_pn_codecs=False,
+        use_component_library=False,
+    )
+    r = clean_component.clean_one(
+        "SMD-INDUCTOR 4.45*4.05*1.2mm 1.0uH ±20% 47mΩMax 4.5A (STPI0412-1R0M-T2)", cfg
+    )
+    assert r[1] == "INDUCTOR"
+    assert r[2] == "OTHER"
+    assert r[3] in ("regex", "other")
+
+
+def test_hanwha_mdb_longest_substring_match():
+    cfg = clean_component.CleanConfig(
+        use_hanwha_mdb=True,
+        hanwha_partnames={"STPI0412-1R0M-T2", "STPI0412"},
+        use_pn_codecs=False,
+        use_component_library=False,
+    )
+    r = clean_component.clean_one("BOM line STPI0412-1R0M-T2 more text", cfg)
+    assert r[0] == "STPI0412-1R0M-T2"
+    assert r[3] == "hanwha_mdb"
 
 
 def test_inferit_other_regex_presets_extract_mpn():

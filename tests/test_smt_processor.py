@@ -56,9 +56,49 @@ def test_read_file_first_row():
 
 
 def test_read_file_last_row():
+    """last_row is 0-based inclusive end index (GUI line L → L-1)."""
     path = os.path.join(tests_path, "assets", "comma.csv")
-    df = smt_processor.read_file(path, first_row=0, last_row=5)
-    assert len(df) <= 5
+    full = smt_processor.read_file(path, first_row=0, last_row=-1)
+    df = smt_processor.read_file(path, first_row=0, last_row=4)
+    assert len(df) == min(5, len(full))
+
+
+def test_read_file_first_row_last_inclusive():
+    """first_row and last_row are 0-based inclusive; a single row is first == last."""
+    import tempfile
+
+    content = "a\nb\nc\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
+        f.write(content)
+        p = f.name
+    try:
+        one = smt_processor.read_file(
+            p, separator=",", first_row=1, last_row=1, column_headers_from_file=False
+        )
+        assert len(one) == 1
+        assert str(one.iloc[0, 0]) == "b"
+    finally:
+        os.unlink(p)
+
+
+def test_read_file_column_headers_from_file_false_keeps_first_row_as_data():
+    """GUI preview: first file row must not become column names."""
+    import tempfile
+
+    content = "alpha,beta,gamma\n10,20,30\n40,50,60\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
+        f.write(content)
+        p = f.name
+    try:
+        df = smt_processor.read_file(p, separator=",", column_headers_from_file=False)
+        assert list(df.columns) == ["0", "1", "2"]
+        assert len(df) == 3
+        assert str(df.iloc[0]["0"]) == "alpha"
+        assert str(df.iloc[0]["1"]) == "beta"
+        assert str(df.iloc[1]["0"]) == "10"
+        assert str(df.iloc[2]["0"]) == "40"
+    finally:
+        os.unlink(p)
 
 
 # ==============================================================================
@@ -92,6 +132,7 @@ def test_processor_config_defaults():
     # Just check it has expected attributes
     assert hasattr(cfg, 'normalize_comments')
     assert hasattr(cfg, 'min_distance_mm')
+    assert hasattr(cfg, 'overlap_xy_are_mm')
 
 
 # ==============================================================================
@@ -147,6 +188,59 @@ def test_find_column_index():
 # ==============================================================================
 # Test cross_check basic
 # ==============================================================================
+
+def test_cross_check_duplicate_xy_ignored_across_layers():
+    """Same X/Y on TOP vs BOTTOM should not count as duplicate_coord."""
+    pd = __import__("pandas")
+    bom_df = pd.DataFrame({"Designator": ["A", "B"], "Value": ["x", "y"]})
+    pnp_df = pd.DataFrame(
+        {
+            "Designator": ["A", "B"],
+            "Comment": ["", ""],
+            "X": [10.0, 10.0],
+            "Y": [20.0, 20.0],
+            "Layer": ["TOP", "BOTTOM"],
+        }
+    )
+    bom_cfg = smt_processor.ColumnConfig(designator="Designator", comment="Value")
+    pnp_cfg = smt_processor.ColumnConfig(
+        designator="Designator",
+        comment="Comment",
+        coord_x="X",
+        coord_y="Y",
+        layer="Layer",
+    )
+    proc = smt_processor.SMTDataProcessor().set_dataframes(bom_df, pnp_df, bom_cfg, pnp_cfg)
+    df = proc.cross_check()
+    dup = df[df["IssueType"] == "duplicate_coord"]
+    assert dup.empty
+
+
+def test_cross_check_duplicate_xy_same_layer_detected():
+    pd = __import__("pandas")
+    bom_df = pd.DataFrame({"Designator": ["A", "B"], "Value": ["x", "y"]})
+    pnp_df = pd.DataFrame(
+        {
+            "Designator": ["A", "B"],
+            "Comment": ["", ""],
+            "X": [10.0, 10.0],
+            "Y": [20.0, 20.0],
+            "Layer": ["TOP", "TOP"],
+        }
+    )
+    bom_cfg = smt_processor.ColumnConfig(designator="Designator", comment="Value")
+    pnp_cfg = smt_processor.ColumnConfig(
+        designator="Designator",
+        comment="Comment",
+        coord_x="X",
+        coord_y="Y",
+        layer="Layer",
+    )
+    proc = smt_processor.SMTDataProcessor().set_dataframes(bom_df, pnp_df, bom_cfg, pnp_cfg)
+    df = proc.cross_check()
+    dup = df[df["IssueType"] == "duplicate_coord"]
+    assert len(dup) >= 1
+
 
 def test_cross_check_basic():
     proc = smt_processor.SMTDataProcessor()

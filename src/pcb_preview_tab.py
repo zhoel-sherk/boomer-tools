@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtSvg import QSvgRenderer
@@ -251,7 +251,7 @@ class PlacementGroupItem(QtWidgets.QGraphicsItemGroup):
 
 
 class PnpArrowNudgeBar(QtWidgets.QWidget):
-    """Компактный ромб: стрелки вокруг поля шага (мм); не растягивается по ширине окна."""
+    """Compact diamond nudge pad around the step field (mm); fixed width."""
 
     nudgeRequested = QtCore.Signal(float, float)
 
@@ -265,7 +265,7 @@ class PnpArrowNudgeBar(QtWidgets.QWidget):
         self._step.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self._step.setFixedWidth(46)
         self._step.setMaximumHeight(30)
-        self._step.setToolTip("Шаг в миллиметрах для кнопок направления")
+        self._step.setToolTip("Step size in millimeters for nudge buttons")
         val = QtGui.QDoubleValidator(0.0001, 1.0e9, 6, self)
         val.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
         self._step.setValidator(val)
@@ -294,7 +294,7 @@ class PnpArrowNudgeBar(QtWidgets.QWidget):
             tb.setIconSize(QtCore.QSize(icon_sz, icon_sz))
             tb.setFixedSize(sz, sz)
             tb.setAutoRaise(True)
-            tb.setToolTip("Сдвиг PnP")
+            tb.setToolTip("Shift PnP placements")
             tb.setAutoRepeat(True)
             tb.setAutoRepeatDelay(400)
             tb.setAutoRepeatInterval(55)
@@ -358,7 +358,7 @@ class PcbPreviewTab(QtWidgets.QWidget):
         self._btn_import_fp.setToolTip("Register footprint file under the PnP Footprint column key")
         self._btn_import_fp.clicked.connect(self._import_kicad_mod)
         top.addWidget(self._btn_import_fp)
-        # --- Временно отключено: ориентиры Gerber / выбор Ref A–B на плате / 2-point similarity ---
+        # --- Disabled: Gerber landmarks / Ref A–B picks / 2-point similarity ---
         # self._btn_align = QtWidgets.QPushButton("Pick Gerber landmarks…")
         # self._btn_align.setCheckable(True)
         # self._btn_align.toggled.connect(self._on_align_toggled)
@@ -383,11 +383,11 @@ class PcbPreviewTab(QtWidgets.QWidget):
         self._btn_reset.clicked.connect(self._reset_transform)
         top.addWidget(self._btn_reset)
         self._chk_mirror_x = QtWidgets.QCheckBox("Mirror PnP X")
-        self._chk_mirror_x.setToolTip("Отразить X в координатах платы (мм)")
+        self._chk_mirror_x.setToolTip("Mirror board X (mm)")
         self._chk_mirror_x.toggled.connect(self._on_mirror_x_toggled)
         top.addWidget(self._chk_mirror_x)
         self._chk_mirror_y = QtWidgets.QCheckBox("Mirror PnP Y")
-        self._chk_mirror_y.setToolTip("Отразить Y в координатах платы (мм)")
+        self._chk_mirror_y.setToolTip("Mirror board Y (mm)")
         self._chk_mirror_y.toggled.connect(self._on_mirror_y_toggled)
         top.addWidget(self._chk_mirror_y)
         self._btn_center = QtWidgets.QPushButton("Center on selection")
@@ -483,6 +483,53 @@ class PcbPreviewTab(QtWidgets.QWidget):
 
     def _append_log(self, msg: str) -> None:
         self._log.appendPlainText(msg)
+
+    def export_ui_prefs(self) -> dict[str, Any]:
+        """Serializable PCB Preview UI prefs (checkboxes / radios / nudge step only — not layer paths)."""
+        gunit = "auto"
+        if self._rb_g_mm.isChecked():
+            gunit = "mm"
+        elif self._rb_g_in.isChecked():
+            gunit = "in"
+        return {
+            "mirror_x": self._chk_mirror_x.isChecked(),
+            "mirror_y": self._chk_mirror_y.isChecked(),
+            "gerber_unit": gunit,
+            "nudge_step": self._nudge_bar._step.text().strip() or "0.5",
+        }
+
+    def apply_ui_prefs(self, prefs: dict[str, Any]) -> None:
+        if not prefs:
+            return
+        mx = bool(prefs.get("mirror_x", False))
+        my = bool(prefs.get("mirror_y", False))
+        self._chk_mirror_x.blockSignals(True)
+        self._chk_mirror_y.blockSignals(True)
+        self._chk_mirror_x.setChecked(mx)
+        self._chk_mirror_y.setChecked(my)
+        self._chk_mirror_x.blockSignals(False)
+        self._chk_mirror_y.blockSignals(False)
+        self._pnp_mirror_x = -1 if mx else 1
+        self._pnp_mirror_y = -1 if my else 1
+
+        gu = str(prefs.get("gerber_unit", "auto")).lower()
+        self._rb_g_auto.blockSignals(True)
+        self._rb_g_mm.blockSignals(True)
+        self._rb_g_in.blockSignals(True)
+        if gu == "mm":
+            self._rb_g_mm.setChecked(True)
+        elif gu == "in":
+            self._rb_g_in.setChecked(True)
+        else:
+            self._rb_g_auto.setChecked(True)
+        self._rb_g_auto.blockSignals(False)
+        self._rb_g_mm.blockSignals(False)
+        self._rb_g_in.blockSignals(False)
+
+        step = str(prefs.get("nudge_step", "0.5")).strip()
+        if step:
+            self._nudge_bar._step.setText(step)
+        self._set_placements_root_transform()
 
     def _zoom_view_in(self) -> None:
         self._view.scale(1.2, 1.2)
@@ -720,7 +767,7 @@ class PcbPreviewTab(QtWidgets.QWidget):
         if br.isValid():
             self._view.fitInView(br, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
 
-    # --- Отключено вместе с UI: pick Gerber / pick Ref A–B (раньше через eventFilter на viewport) ---
+    # --- Disabled with UI: Gerber pick / Ref A–B (was eventFilter on viewport) ---
     # def _on_align_toggled(self, on: bool) -> None: ...
     # def _on_pick_refs_toggled(self, on: bool) -> None: ...
     # def eventFilter(self, obj, event) -> bool: ...
@@ -751,10 +798,10 @@ class PcbPreviewTab(QtWidgets.QWidget):
                 return
         super().keyPressEvent(event)
 
-    # def _pnp_point(self, ref: str) -> Optional[tuple[float, float]]: ...  # только для 2-point
+    # def _pnp_point(self, ref: str) -> Optional[tuple[float, float]]: ...  # 2-point alignment only
     # def _apply_similarity(self) -> None:
     #     from pcb_preview.alignment import similarity_from_two_point_pairs
-    #     ...  # см. историю git: два клика по Gerber + Ref A/B + Apply
+    #     ...  # see git history: two Gerber clicks + Ref A/B + Apply
 
     def _reset_transform(self) -> None:
         self._preview_sim = Similarity2D.identity()

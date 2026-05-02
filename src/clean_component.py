@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple, Set
+from typing import TYPE_CHECKING, AbstractSet, List, Optional, Tuple, Set
 
 import logger
 
@@ -54,10 +54,8 @@ class CleanConfig:
     cap_include_dielectric: bool = True
     cap_include_tolerance: bool = True
     cap_convert_nf_to_uf: bool = False
-    # Inductor
-    inductor_include_package: bool = True
-    inductor_include_current: bool = True
-    inductor_include_tolerance: bool = True
+    # Inductor — template slots: pack, nom, %, Imax, DCR (like RES/CAP template combos).
+    inductor_template: Tuple[str, ...] = ("pack", "nom", "%", "Imax", "DCR")
     # MPN decoders in pn_original (Yageo/Murata/TAI_RM/…); independent of the «vendor» source label
     use_pn_codecs: bool = True
     # When True, clean_one Source is «vendor»; when False but use_pn_codecs, Source is «pn»
@@ -78,6 +76,9 @@ class CleanConfig:
     prefix_use_separator: bool = True
     # User-maintained OTHER/component overrides from components.txt.
     use_component_library: bool = True
+    # Hanwha UPD PART_Det PARTNAME list (from Machine lib tab); gated by use_hanwha_mdb in UI.
+    use_hanwha_mdb: bool = False
+    hanwha_partnames: Optional[Set[str]] = None
 
 
 def _default_config(config: Optional[CleanConfig]) -> CleanConfig:
@@ -86,6 +87,7 @@ def _default_config(config: Optional[CleanConfig]) -> CleanConfig:
 
 _RES_TEMPLATE_FIELDS = {"nom", "pack", "watt", "%"}
 _CAP_TEMPLATE_FIELDS = {"nom", "pack", "film", "%", "W"}
+_IND_TEMPLATE_FIELDS = {"pack", "nom", "%", "Imax", "DCR"}
 
 
 def _template_fields(
@@ -173,17 +175,46 @@ def _format_cap_fields(fields: dict[str, str], cfg: CleanConfig) -> str:
     return _apply_prefix(out, cfg.cap_prefix, cfg)
 
 
+def _inductor_pack_guess(s: str) -> str:
+    """Infer SMD size code from MPN in parentheses (e.g. STPI0412-…) or explicit package token."""
+    m = re.search(r"\(([A-Z0-9][A-Z0-9+\-]{3,})\)", s, re.I)
+    if m:
+        tok = m.group(1)
+        em = re.search(r"(?<=[A-Za-z])(\d{4})(?=[A-Za-z\-]|$)", tok)
+        if em:
+            return em.group(1)
+    mm = re.search(rf"\b({PACKAGE_PATTERN})\b", s, re.I)
+    return mm.group(1) if mm else ""
+
+
 def _format_inductor_fields(fields: dict[str, str], cfg: CleanConfig) -> str:
-    result: list[str] = []
-    if cfg.inductor_include_package and fields.get("pack"):
-        result.append(fields["pack"])
-    if fields.get("nom"):
-        result.append(fields["nom"])
-    if cfg.inductor_include_current and fields.get("current"):
-        result.append(fields["current"])
-    if cfg.inductor_include_tolerance and fields.get("%"):
-        result.append(fields["%"])
-    return _apply_prefix(cfg.output_separator.join(result), cfg.inductor_prefix, cfg)
+    f = {k: v for k, v in fields.items() if v}
+    out = _format_component_fields(
+        f,
+        cfg.inductor_template,
+        _IND_TEMPLATE_FIELDS,
+        ("pack", "nom", "%", "Imax", "DCR"),
+        cfg.output_separator,
+    )
+    return _apply_prefix(out, cfg.inductor_prefix, cfg)
+
+
+def match_hanwha_mdb_partname(comment: str, partnames: AbstractSet[str]) -> Optional[str]:
+    """Longest PARTNAME substring match (case-insensitive)."""
+    if not comment or not partnames:
+        return None
+    s = str(comment).strip()
+    if not s:
+        return None
+    sf = s.casefold()
+    best = ""
+    for pn in partnames:
+        p = str(pn).strip()
+        if len(p) < 2:
+            continue
+        if p.casefold() in sf and len(p) > len(best):
+            best = p
+    return best or None
 
 
 def _normalize_value_unit(text: str) -> str:
@@ -288,12 +319,40 @@ def _parse_inferit_inductor(spec: str, cfg: CleanConfig) -> Optional[str]:
         nom = f"{m.group('ohm')}R"
         if freq:
             nom = f"{nom}@{freq.upper()}"
+        imax = re.sub(r"\s+", "", m.group("cur")).upper()
         return _format_inductor_fields(
             {
                 "pack": m.group("pack"),
                 "nom": nom,
-                "current": re.sub(r"\s+", "", m.group("cur")).upper(),
+                "Imax": imax,
                 "%": f"{m.group('tol')}%",
+                "DCR": "",
+            },
+            cfg,
+        )
+    smd = re.search(
+        r"SMD-INDUCTOR\s+"
+        r"[\d.]+\*[\d.]+\*[\d.]+\s*mm\s+"
+        r"(?P<nomv>[0-9.]+\s*[uµ]?H)\b"
+        r".*?(?P<tol>(?:±|\+/-)\s*[0-9.]+\s*%)"
+        r".*?(?P<dcr>[0-9.]+\s*mΩ(?:Max)?)"
+        r".*?(?P<imax>[0-9.]+\s*A)\b",
+        s,
+        re.I | re.S,
+    )
+    if smd:
+        tol_raw = re.sub(r"\s+", "", smd.group("tol"))
+        tol_pct = tol_raw.replace("±", "").replace("+/-", "") if tol_raw else ""
+        dcr_raw = smd.group("dcr")
+        dcr = re.sub(r"\s+", "", dcr_raw).replace("Max", "") if dcr_raw else ""
+        pack = _inductor_pack_guess(s)
+        return _format_inductor_fields(
+            {
+                "pack": pack,
+                "nom": _normalize_value_unit(smd.group("nomv")),
+                "%": tol_pct if tol_pct.endswith("%") else f"{tol_pct}%",
+                "Imax": re.sub(r"\s+", "", smd.group("imax")).upper(),
+                "DCR": dcr,
             },
             cfg,
         )
@@ -304,12 +363,17 @@ def _parse_inferit_inductor(spec: str, cfg: CleanConfig) -> Optional[str]:
         return None
     tm = re.search(r"(?:±|\+/-)\s*(?P<tol>[0-9]+(?:\.[0-9]+)?)\s*%", s, re.I)
     cm = re.search(r"(?P<cur>[0-9]+(?:\.[0-9]+)?\s*A)\b", s, re.I)
+    dm = re.search(r"(?P<dcr>[0-9.]+\s*mΩ(?:Max)?)", s, re.I)
+    dcr_s = ""
+    if dm:
+        dcr_s = re.sub(r"\s+", "", dm.group("dcr")).replace("Max", "")
     return _format_inductor_fields(
         {
-            "pack": "",
+            "pack": _inductor_pack_guess(s),
             "nom": _normalize_value_unit(vm.group("value")),
-            "current": re.sub(r"\s+", "", cm.group("cur")).upper() if cm else "",
+            "Imax": re.sub(r"\s+", "", cm.group("cur")).upper() if cm else "",
             "%": f"{tm.group('tol')}%" if tm else "",
+            "DCR": dcr_s,
         },
         cfg,
     )
@@ -746,9 +810,10 @@ def parse_inductor(spec: str, config: Optional[CleanConfig] = None) -> str:
     
     package = ''
     value = ''
-    current = ''
+    imax = ''
     tolerance = ''
-    
+    dcr = ''
+
     for part in parts:
         if not part:
             continue
@@ -756,8 +821,10 @@ def parse_inductor(spec: str, config: Optional[CleanConfig] = None) -> str:
             package = part
         elif 'V' in part.upper() and any(c.isdigit() for c in part) and 'A' not in part.upper():
             continue  # Skip voltage, not current for inductors
-        elif 'A' in part.upper() and any(c.isdigit() for c in part):
-            current = part.upper().replace(' ', '')
+        elif 'A' in part.upper() and any(c.isdigit() for c in part) and 'Ω' not in part.upper():
+            imax = part.upper().replace(' ', '')
+        elif 'mΩ' in part.upper() or 'mohm' in part.upper():
+            dcr = re.sub(r"\s+", "", part).upper().replace("MAX", "")
         elif '%' in part:
             tol = part.replace('%', '').replace('±', '')
             if tol and tol != '30':
@@ -780,7 +847,7 @@ def parse_inductor(spec: str, config: Optional[CleanConfig] = None) -> str:
                 break
     
     result = _format_inductor_fields(
-        {"pack": package, "nom": value, "current": current, "%": tolerance},
+        {"pack": package, "nom": value, "Imax": imax, "%": tolerance, "DCR": dcr},
         cfg,
     )
     return result if result else spec
@@ -953,13 +1020,16 @@ def clean_one(
     """
     One BOM comment → cleaned string, display type, part code, source note.
 
-    Source: '' | 'vendor' | 'pn' | 'library' | 'regex' | 'other' | 'off'
+    Source: '' | 'vendor' | 'pn' | 'library' | 'regex' | 'other' | 'off' | 'hanwha_mdb'
     """
     cfg = _default_config(config)
     if not str(orig).strip():
         return "", "OTHER", "OTHER", ""
     s = str(orig).strip()
     ctype = classify_component_type(s)
+    eff_vendor = ctype
+    if ctype == "INDUCTOR" and not cfg.parse_inductors:
+        eff_vendor = "OTHER"
     preset_cleaned = None
     if ctype == "RESISTOR" and cfg.parse_resistors:
         preset_cleaned = _parse_inferit_resistor(s, cfg)
@@ -976,8 +1046,8 @@ def clean_one(
         )
     # Vendor MPN (try classifier hint, then the other for RES/CAP, or CAP+RES for OTHER)
     pnr: Optional[Tuple[str, str]] = None
-    if ctype in ("RESISTOR", "CAP", "OTHER"):
-        pnr = _try_parse_vendor_pn_res_cap_any(s, cfg, ctype)
+    if eff_vendor in ("RESISTOR", "CAP", "OTHER"):
+        pnr = _try_parse_vendor_pn_res_cap_any(s, cfg, eff_vendor)
     if pnr:
         pnv, eff = pnr[0], pnr[1]
         pnv = _reformat_cleaned_pn(pnv, eff, cfg)
@@ -1017,12 +1087,19 @@ def clean_one(
             _map_classify_to_part_code(c_eff),
             "library",
         )
+    if cfg.use_hanwha_mdb and cfg.hanwha_partnames:
+        hit = match_hanwha_mdb_partname(s, cfg.hanwha_partnames)
+        if hit:
+            return hit, "OTHER", "OTHER", "hanwha_mdb"
     if ctype == "RESISTOR" and not cfg.parse_resistors:
         return s, "RESISTOR", "RES", "off"
     if ctype == "CAP" and not cfg.parse_capacitors:
         return s, "CAP", "CAP", "off"
     if ctype == "INDUCTOR" and not cfg.parse_inductors:
-        return s, "INDUCTOR", "IND", "off"
+        cleaned_o = clean_other(s)
+        if cleaned_o:
+            return cleaned_o, "INDUCTOR", "OTHER", "regex"
+        return s, "INDUCTOR", "OTHER", "other"
     part_code = _map_classify_to_part_code(ctype)
     note = "regex" if ctype in ("RESISTOR", "CAP", "INDUCTOR") else "other"
     return clean_component(part_code, s, cfg), _type_tag_for_classify(ctype), part_code, note

@@ -70,6 +70,31 @@ def result_dataframe_to_html(
     return "\n".join(out)
 
 
+def html_document_from_fragment(
+    fragment: str,
+    *,
+    title: str = "Cross-check report",
+) -> str:
+    """Wrap the clipboard-oriented fragment in a minimal HTML5 document for saving to disk."""
+    safe_title = html_mod.escape(title)
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8"/>\n'
+        f"<title>{safe_title}</title>\n"
+        "<style>"
+        "body{font-family:system-ui,Segoe UI,sans-serif;margin:1rem;line-height:1.35;"
+        "background:#fafafa;color:#222}"
+        "</style>\n"
+        "</head>\n"
+        "<body>\n"
+        f"{fragment}\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
 def result_dataframe_plain_text(df: pd.DataFrame) -> str:
     """Plain text fallback for clipboard."""
     if df is None or df.empty:

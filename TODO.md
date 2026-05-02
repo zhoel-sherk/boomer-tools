@@ -39,6 +39,8 @@ Core services
       +--> Future web UI
 ```
 
+**Core vs GUI rule:** modules that implement parsing, cleaning, merge, cross-check, file I/O, and machine-library **must not import PySide6** (same spirit as `src/smt_processor.py`, `src/pcb_preview/`, `src/machine_library/`). The main window may orchestrate threads, `QSettings`, and dialogs, but **new business behavior** belongs in core or in thin **GUI-free services** (see Phase 2 and Phase 7), not only in `app_pyside6.py`.
+
 ## Current State
 
 ### PySide6 Desktop UI
@@ -49,7 +51,13 @@ Core services
 - [x] Column mapping dropdowns are aligned above table columns.
 - [x] BOM/PnP `1st` / `Last` row ranges are highlighted in the row-number header.
 - [x] BOM/PnP Find/Replace dialogs exist.
-- [x] Recent file paths and key settings are stored in `QSettings`.
+- [x] **ALPHA v0.1.0:** `QSettings` uses org **`Boomer`** / application **`BoomerTools`** (new keys; legacy **`BoomerPySide6`** not migrated).
+- [x] **ALPHA v0.1.0:** BOM/PnP **separator**, **Has headers**, **1st/Last** rows, and **column mapping** dropdowns persist **per loaded file path** (hash-keyed).
+- [x] **Named UI profiles** (`default` + Clone/Delete): theme, language, colorful logs, BOM/PnP load controls + mapping combo values, Merge/Report/Clean/PCB Preview (widget prefs only) stored as JSON per profile; snapshot saved on app close for the **active** profile.
+- [x] **Clear** on BOM/PnP tabs unloads workspace (table + mapping); does not delete profile data.
+- [x] Theme, Clean BOM, merge/report overlap, PnP units, and related flat keys remain compatible with legacy fallback load where no profile JSON exists.
+- [ ] **Last-opened BOM/PnP paths** are intentionally **not** persisted (`files/last_*` removed); optional future **project file** or persisted MRU for pairs (see Phase 1).
+- [x] Main window shows an **ALPHA / WIP** banner; Hanwha MDB editor uses autosave + “Recovered working copy” like BOM/PnP (`hanwha_mdb` snapshots).
 - [x] Cross-check runs in a background thread.
 - [x] Theme toggle exists.
 
@@ -58,6 +66,8 @@ Core services
 - [x] **PCB Preview** tab in PySide6 (`src/pcb_preview_tab.py`, `src/pcb_preview/`, bridge from current PnP table).
 - [x] Gerber stack: load layers, visibility, units (Auto/mm/inch scale), wheel zoom, Fit all, higher raster DPI (gerbonara → SVG).
 - [x] PnP overlay on Gerber: centroids, optional `.kicad_mod` outlines (kiutils), ref labels, mirror X/Y, mm **nudge** in sidebar.
+- [x] PCB Preview **widget** prefs (mirror X/Y, Gerber unit mode, nudge step) persist via **active UI profile** JSON (no Gerber file paths).
+- [ ] Persist **last Gerber folder / open layer paths** in `QSettings` or defer explicitly.
 - [ ] Revisit automated 2-point Gerber↔PnP alignment (currently commented in favor of manual nudge).
 - [ ] Add focused tests and small Gerber/PnP fixtures for the Qt-free preview core.
 
@@ -143,36 +153,14 @@ Recent targeted checks:
 - Changed modules compiled with `py_compile`.
 - Linter diagnostics were clean for edited files.
 
-Current full-suite status:
+Current full-suite status (see also `README.md`; re-run after dependency/code changes):
 
-- `python3 -m pytest boomer/tests -q`
-- Result: `64 passed, 4 skipped, 9 failed`.
+- `cd boomer && export PYTHONPATH=src && python -m pytest tests -q`
+- Last documented run in project `.venv`: **`104 passed, 4 skipped`** (counts drift if fixtures/API change).
 
-Known full-suite failures to classify/fix:
+Earlier snapshot (before reader/test alignment): **`64 passed, 4 skipped, 9 failed`** — concentrated in example6 column expectations, `cross_check.compare` signature, and grid reader row/column counts. Re-run the suite after changes; if failures return, list failing nodes here again.
 
-- `tests/test_clean_component.py`
-  - `test_example6_bom_golden_def_bijection`
-  - `test_example6_bom_dip_mpn_anchors_in_vendor_comment`
-  - Current issue: the example6 supplier BOM fixture is read as 6 columns while these tests expect column index `8`.
-- `tests/test_cross_check.py`
-  - `test_no_bom`
-  - `test_no_pnp`
-  - Current issue: tests call old `cross_check.compare()` signature without `min_distance` / `coord_unit_mils`.
-- `tests/test_csv_reader.py`
-  - `test_csv_comma`
-  - `test_csv_spaces`
-  - Current issue: expected row counts no longer match current reader behavior.
-- `tests/test_ods_reader.py`
-  - `test_bom`
-  - Current issue: expected column count no longer matches current ODS reader behavior.
-- `tests/test_xls_reader.py`
-  - `test_bom`
-  - Current issue: expected row count no longer matches current XLS reader behavior.
-- `tests/test_xlsx_reader.py`
-  - `test_bom`
-  - Current issue: expected row count no longer matches current XLSX reader behavior.
-
-Full legacy test-suite cleanup is still pending; these failures are recorded separately from the targeted working-path checks.
+Full legacy test-suite cleanup remains an ongoing hygiene task.
 
 ### Yedytor / Yamaha (concrete integration steps)
 
@@ -188,30 +176,13 @@ Reference: [yedytor](https://github.com/marmidr/yedytor) (MIT) — parsers and m
 
 ### 1. GitHub Documentation Prep
 
-- [ ] Rewrite `README.md` for this fork.
-- [ ] Clearly explain the relationship:
-  - upstream: `marmidr/boomer`;
-  - fork: `zhoel-sherk/boomer-tools`.
-- [ ] Document the PySide6 app as the primary current UI.
+- [x] `README.md` describes this fork, upstream vs fork, PySide6 as primary UI, formats, install/run, tests, and current ALPHA status (iterate as features land).
 - [ ] Add screenshots or updated UI images for:
-  - Project;
+  - Project (incl. profiles);
   - BOM/PnP mapping;
   - Clean BOM;
   - Merge;
   - Report.
-- [ ] Document supported file formats:
-  - `.xls`;
-  - `.xlsx`;
-  - `.csv`;
-  - `.ods`;
-  - `.txt`;
-  - `.tab`.
-- [ ] Document basic run commands:
-  - create venv;
-  - install dependencies;
-  - run PySide6 app;
-  - run tests.
-- [ ] Add a short “Current status” section so users know this is an active fork under development.
 
 ### 2. Release Hygiene
 
@@ -246,7 +217,18 @@ Reference: [yedytor](https://github.com/marmidr/yedytor) (MIT) — parsers and m
 - [ ] Promote frequent stable fallbacks to focused parsers or presets.
 - [ ] Collect real machine-library files for matching research:
   - Yamaha `.Tou` / `DevLibEd.Lib` examples from `marmidr/yedytor`;
-  - Hanwha `.mdb` database files from production.
+  - Hanwha: **local production sample `UPD.MDB`** (keep outside Git; derive a tiny sanitized fixture or CSV exports for tests only).
+
+## Performance (profiling-driven)
+
+Do not optimize blindly: run a profiler on slow user paths (large XLSX open, merge, cross-check, autosave) and confirm bottlenecks. Prioritized ideas (low effort → high impact first):
+
+1. **Pandas row iteration** — replace `DataFrame.iterrows()` with `itertuples()` or per-column numpy/Series iteration in hot paths (`src/smt_processor.py` merge/cross-check, `src/hanwha_mdb_edit/core/save.py`, `src/hanwha_mdb_edit/core/part_det_repository.py`, `src/report_html.py`). No new dependencies; high payoff on large PnP tables.
+2. **Excel read** — optional **`python-calamine`** engine for `.xlsx`/`.xls` in `_read_excel` (`smt_processor.py`): much faster reads; requires regression tests (Chinese BOM `header=3` heuristic, misleading “Excel” files that fall back to CSV). ODS stays on `odf`; calamine is read-only.
+3. **Excel write** — for very large merge exports, optional **`XlsxWriter`** path instead of `df.to_excel(..., engine="openpyxl")` (`export_excel`): faster writes; not a drop-in (explicit sheet write loop).
+4. **Working-copy snapshots** — optional **Parquet (`pyarrow`)** alongside or instead of pickle in `src/working_copy.py` for large tables: smaller/faster I/O; watch `object` columns and migrate old `.pkl` keys on load.
+
+Optional hygiene: **`orjson`** for snapshot JSON metadata if profiling shows significant time there.
 
 ## Roadmap
 
@@ -256,9 +238,9 @@ Reference: [yedytor](https://github.com/marmidr/yedytor) (MIT) — parsers and m
 - [ ] Save and restore more session state:
   - window geometry;
   - selected tab;
-  - last folders;
-  - active column mappings;
-  - recent BOM/PnP pairs.
+  - last folders (file dialogs / Gerber);
+  - ~~active column mappings~~ — **partially done:** per-file hash prefs + profile JSON for BOM/PnP combo values;
+  - recent BOM/PnP pairs (persisted project or explicit MRU — not only in-memory).
 - [ ] Define what a “project” means:
   - recent file pair + settings only;
   - or a saved `.boomer-project.json`.
@@ -267,7 +249,7 @@ Reference: [yedytor](https://github.com/marmidr/yedytor) (MIT) — parsers and m
 
 ### Phase 2 - Extract a Service Layer
 
-- [ ] Move orchestration out of `src/app_pyside6.py` into GUI-independent services.
+- [ ] Move orchestration out of `src/app_pyside6.py` into GUI-independent services (a thin **facade** is enough at first: one module that builds `ColumnConfig` / `ProcessorConfig` / `SMTDataProcessor` from plain values and exposes `run_cross_check`, `run_merge`, etc., so `MainWindow` only reads widgets → calls facade → updates models).
 - [ ] Candidate modules:
   - `src/services/file_service.py`;
   - `src/services/clean_service.py`;
@@ -280,6 +262,8 @@ Reference: [yedytor](https://github.com/marmidr/yedytor) (MIT) — parsers and m
   - plain result objects;
   - no Qt types.
 - [ ] Add tests around services before deeply splitting the UI.
+- [ ] Optional later: CI guard (e.g. script or `grep`) that fails if `PySide6` appears in agreed core paths (`smt_processor.py`, `clean_component.py`, `pcb_preview/`, `machine_library/`, `services/`).
+- [ ] Cross-reference **Performance (profiling-driven)** when services own Excel I/O and large table loops.
 
 ### Phase 3 - Clean BOM Coverage
 
@@ -356,7 +340,8 @@ Planned machine-library support:
   - `.Tou`;
   - `DevLibEd.Lib`;
   - `DevLibEd2.Lib`.
-- [ ] Add Hanwha import after real `.mdb` samples are available.
+- [x] Inspect sample `UPD.MDB`: schema notes in `doc/hanwha_UPD_mdb_schema.md`; **`PART_Det` → `PARTNAME`** is the machine library string; Qt-free reader `src/machine_library/hanwha_mdbtools.py` + **Machine lib** tab (WIP).
+- [ ] Add Hanwha import backed by a **sanitized** fixture (never commit full proprietary `.mdb`).
 - [ ] Research Hanwha `.mdb` access options:
   - `pyodbc` / Access ODBC on Windows;
   - `mdbtools` on Linux;
@@ -395,7 +380,7 @@ Planned machine-library support:
 
 ### Phase 7 - PySide6 UI Split
 
-- [ ] Split `src/app_pyside6.py` into smaller UI modules:
+- [ ] Split `src/app_pyside6.py` into smaller UI modules under `src/ui/` (or `src/gui/` — pick one name and keep imports consistent):
   - `ui/main_window.py`;
   - `ui/project_tab.py`;
   - `ui/bom_tab.py`;
@@ -403,8 +388,9 @@ Planned machine-library support:
   - `ui/clean_tab.py`;
   - `ui/merge_tab.py`;
   - `ui/report_tab.py`;
-  - `ui/settings.py`.
-- [ ] Keep Qt-specific code inside `ui/`.
+  - `ui/settings.py`;
+  - optional `ui/threads.py` for `QThread` workers (e.g. cross-check).
+- [ ] Keep Qt-specific code inside `ui/` (or `gui/`).
 - [ ] Keep data transformations in services and core modules.
 - [ ] Add compact advanced-settings sections for Clean BOM.
 - [ ] Add inline output examples for active templates.
@@ -500,4 +486,4 @@ Use these names consistently:
 
 Boomer Tools is currently an active PySide6 desktop fork focused on real BOM/PnP normalization and SMT machine preparation.
 
-Next priority: update `README.md`, clean up release metadata, validate the full desktop workflow on real projects, and start extracting reusable services from the large PySide6 window module.
+Next priority: update `README.md`, clean up release metadata, validate the full desktop workflow on real projects, extract a **GUI-free service/facade layer** from `app_pyside6.py`, and apply **profiling-driven** performance work from **Performance (profiling-driven)** where real bottlenecks show up.

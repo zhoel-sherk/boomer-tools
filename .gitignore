@@ -9,10 +9,25 @@ __pycache__/
 **/__pycache__/
 .pytest_cache/
 **/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 *.coverage
 coverage.xml
 htmlcov/
+
+# Virtual environments (never commit)
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / local installs
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
 
 # Local app/runtime state
 boomer.ini
@@ -42,6 +57,11 @@ merged*.csv
 merged*.xlsx
 report*.html
 examples/*/*.html
+# App-generated cross-check HTML (any prefix / BOM naming)
+*cross_check_report*.html
+
+# Local UI screenshots added by mistake (keep repo lean)
+examples/t-olp screenshots/
 
 # Local-only example/archive folders
 examples/SmoCharger/
@@ -50,6 +70,11 @@ example_ctk/
 
 # Local-only AI / agent context (not shipped in git)
 LLM.md
+session-ses_*.md
+
+# IDE / editor (local only; keep shared .vscode in repo if present)
+.idea/
+.cursor/
 
 # Optional vendored dependency experiments
 src/odfpy

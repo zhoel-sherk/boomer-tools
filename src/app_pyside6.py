@@ -1,12 +1,14 @@
 """
-Boomer GUI на PySide6 - параллельная версия.
+PySide6 desktop GUI for Boomer Tools (BOM / PnP workflows).
 
 (c) 2023-2026 Mariusz Midor
 """
 
+import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Optional, Any
 from urllib.parse import quote
 
@@ -17,40 +19,74 @@ import pandas as pd
 
 from qt_material import apply_stylesheet
 
+from settings_paths import path_settings_hash
 from smt_processor import (
     SMTDataProcessor,
     ColumnConfig,
     ProcessorConfig,
     read_file,
     read_text_whitespace_sp,
-    apply_row_as_column_header,
     _clean_empty_rows,
     SMTProcessorError,
     SMTEmptyDataError,
 )
 from qt_models import SortableTableModel
-from report_html import result_dataframe_to_html, result_dataframe_plain_text
+from report_html import (
+    html_document_from_fragment,
+    result_dataframe_plain_text,
+    result_dataframe_to_html,
+)
 
 from clean_component import CleanConfig, clean_bom_dataframe, clean_preview
 from component_library import append_component, default_components_path
 from pn_original import normalize_mpn_bare
-from working_copy import find_snapshot, save_snapshot
+from working_copy import save_snapshot
+from working_copy_ui import prompt_recover_snapshot
 
 from pcb_preview_tab import PcbPreviewTab
+from machine_library_tab import MachineLibraryTab
+from ui_i18n import UiI18n
+
+import pnp_coord
 
 import logger
 
-APP_NAME = "BOM vs PnP Cross Checker"
-APP_VERSION = "0.12.0"
+APP_NAME = "Boomer Tools"
+APP_VERSION = "0.1.0"
+VERSION_DISPLAY = "ALPHA v0.1.0"
 
 SETTINGS_ORG = "Boomer"
-SETTINGS_APP = "BoomerPySide6"
+SETTINGS_APP = "BoomerTools"
+
+PROFILE_STATE_VERSION = 1
+PROFILE_NAMES_KEY = "profiles/names"
+PROFILE_LAST_ACTIVE_KEY = "profiles/last_active"
+
+# Hidden from UI: False = treat loaded grids as «no dedicated header row» for core mapping (matches
+# full-row preview: «spaces» loader does not promote a row into column names).
+HIDDEN_TABLE_HAS_HEADER_ROW = False
 
 LIGHT_THEME = "light_blue.xml"
 DARK_THEME = "dark_blue.xml"
 
+# Preview table: numeric column headers only; thin horizontal header under mapping combos.
+_PREVIEW_TABLE_HDR_HEIGHT = 22
+_MAPPING_COMBO_MAX_HEIGHT = 26
+
 # Cap table column auto-width so BOM/PnP load does not force a multi-screen-wide window.
 _TABLE_COL_MAX_WIDTH = 400
+
+# Tab order for i18n (must match addTab sequence in _setup_ui).
+_TAB_ORDER_KEYS = (
+    "project",
+    "bom",
+    "pnp",
+    "clean_bom",
+    "merge",
+    "report",
+    "pcb_preview",
+    "machine_lib",
+)
 
 
 class CrossCheckThread(QtCore.QThread):
@@ -74,14 +110,12 @@ class CrossCheckThread(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Главное окно приложения"""
-    
-    # signals для обновления UI
+    """Main application window."""
+
     log_message = QtCore.Signal(str, str)  # message, level
-    
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1400, 900)
         
         # Data processor
@@ -103,7 +137,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QStandardPaths.StandardLocation.AppDataLocation
         )
         self._autosave_dir = os.path.join(
-            app_data or os.path.expanduser("~/.local/share/Boomer"), "autosave"
+            app_data or os.path.expanduser("~/.local/share/BoomerTools"), "autosave"
         )
         self._current_theme = LIGHT_THEME
         self._cc_thread: Optional[CrossCheckThread] = None
@@ -115,23 +149,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._autosave_timer = QtCore.QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self._autosave_dirty_working_copies)
+        self._bom_ui_restoring = False
+        self._pnp_ui_restoring = False
+        self._bom_tab_settings_timer = QtCore.QTimer(self)
+        self._bom_tab_settings_timer.setSingleShot(True)
+        self._bom_tab_settings_timer.timeout.connect(self._save_bom_tab_settings_to_disk)
+        self._pnp_tab_settings_timer = QtCore.QTimer(self)
+        self._pnp_tab_settings_timer.setSingleShot(True)
+        self._pnp_tab_settings_timer.timeout.connect(self._save_pnp_tab_settings_to_disk)
+
+        self._profile_restore_bom_mappings: Optional[list[str]] = None
+        self._profile_restore_pnp_mappings: Optional[list[str]] = None
+
+        _raw_lang = self._settings.value("ui/language", "en")
+        _lang = str(_raw_lang) if _raw_lang is not None else "en"
+        self._i18n = UiI18n(_lang if _lang in ("en", "ru") else "en")
+        self.setWindowTitle(self.ui_tr("app.window_title"))
 
         self._setup_ui()
         self._load_settings()
-        self._log("Application ready", "info")
-    
+        self._log(self.ui_tr("msg.app_ready"), "info")
+
+    def ui_tr(self, key: str, **kwargs: Any) -> str:
+        """UI string from current language catalog."""
+        return self._i18n.tr(key, **kwargs)
+
     def _setup_ui(self):
-        """Настройка UI"""
+        """Build main UI."""
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        
+
         main_layout = QtWidgets.QVBoxLayout(central)
-        
-        # Tab widget
+
+        self._wip_banner = QtWidgets.QLabel(self.ui_tr("wip.banner"))
+        self._wip_banner.setWordWrap(True)
+        self._wip_banner.setStyleSheet(
+            "padding: 8px; background-color: #fff3cd; color: #664d03; border-radius: 4px;"
+        )
+        main_layout.addWidget(self._wip_banner)
+
         self.tabs = QtWidgets.QTabWidget()
         main_layout.addWidget(self.tabs)
-        
-        # Создаем вкладки
+
+        # Tabs (titles filled via ui_tr inside each _create_* or here — set after add)
         self._create_project_tab()
         self._create_bom_tab()
         self._create_pnp_tab()
@@ -139,82 +199,165 @@ class MainWindow(QtWidgets.QMainWindow):
         self._create_merge_tab()
         self._create_report_tab()
         self._create_pcb_preview_tab()
-        
-        # Theme toggle в status bar
-        self.statusBar().showMessage("Ready")
+        self._create_machine_library_tab()
 
-        self._theme_button = QtWidgets.QPushButton("☀ Light")
-        self._theme_button.setCheckable(True)
-        self._theme_button.setToolTip("Toggle dark / light (qt-material)")
-        self._theme_button.clicked.connect(self._toggle_theme)
-        self.statusBar().addPermanentWidget(self._theme_button)
-    
+        self._sync_tab_titles_i18n()
+
+        self.statusBar().showMessage(self.ui_tr("status.ready"))
+
+    def _sync_tab_titles_i18n(self) -> None:
+        for i, key in enumerate(_TAB_ORDER_KEYS):
+            if i < self.tabs.count():
+                self.tabs.setTabText(i, self.ui_tr(f"tab.{key}"))
+
+    def _refresh_static_ui_texts(self) -> None:
+        """Re-apply translated strings (after language change)."""
+        self.setWindowTitle(self.ui_tr("app.window_title"))
+        self._wip_banner.setText(self.ui_tr("wip.banner"))
+        self.statusBar().showMessage(self.ui_tr("status.ready"))
+        self._sync_tab_titles_i18n()
+        self._refresh_project_tab_static_texts()
+        if hasattr(self, "_theme_button"):
+            dark = self._theme_button.isChecked()
+            self._theme_button.setText(self.ui_tr("theme.dark" if dark else "theme.light"))
+            self._theme_button.setToolTip(self.ui_tr("theme.tooltip"))
+
+    def _refresh_project_tab_static_texts(self) -> None:
+        if not hasattr(self, "project_bom_group"):
+            return
+        self.project_bom_group.setTitle(self.ui_tr("project.bom_file"))
+        self.project_pnp_group.setTitle(self.ui_tr("project.pnp_file"))
+        self.project_settings_group.setTitle(self.ui_tr("project.settings"))
+        self.project_console_group.setTitle(self.ui_tr("project.console"))
+        self.btn_browse_bom.setText(self.ui_tr("project.browse"))
+        self.btn_browse_pnp.setText(self.ui_tr("project.browse"))
+        self.profile_label.setText(self.ui_tr("project.profile"))
+        self.btn_profile_clone.setText(self.ui_tr("project.profile_clone"))
+        self.btn_profile_delete.setText(self.ui_tr("project.profile_delete"))
+        self.chk_colorful.setText(self.ui_tr("project.colorful_logs"))
+        self.lang_label.setText(self.ui_tr("project.language"))
+        self.theme_label.setText(self.ui_tr("project.theme"))
+        if self._bom_source_path:
+            self.bom_path_label.setText(self._bom_source_path)
+        else:
+            self.bom_path_label.setText(self.ui_tr("project.no_file"))
+        if self._pnp_source_path:
+            self.pnp_path_label.setText(self._pnp_source_path)
+        else:
+            self.pnp_path_label.setText(self.ui_tr("project.no_file"))
+
+    def _on_ui_language_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        lang = self.lang_combo.currentData()
+        if not lang:
+            return
+        lang_s = str(lang)
+        if lang_s not in ("en", "ru"):
+            return
+        self._apply_ui_language(lang_s, save=True)
+
+    def _apply_ui_language(self, lang: str, *, save: bool = True) -> None:
+        if lang not in ("en", "ru"):
+            lang = "en"
+        self._i18n.set_locale(lang)
+        if save:
+            self._settings.setValue("ui/language", lang)
+        self.lang_combo.blockSignals(True)
+        idx = self.lang_combo.findData(lang)
+        if idx >= 0:
+            self.lang_combo.setCurrentIndex(idx)
+        self.lang_combo.blockSignals(False)
+        self._refresh_static_ui_texts()
+
     def _create_project_tab(self):
-        """Вкладка Project - выбор файлов и профили"""
+        """Project tab — file selection, settings (profile, theme, language), console."""
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Project")
-        
+        self.tabs.addTab(tab, self.ui_tr("tab.project"))
+
         layout = QtWidgets.QVBoxLayout(tab)
-        
-        # BOM file selection
-        group = QtWidgets.QGroupBox("BOM File")
-        group_layout = QtWidgets.QHBoxLayout(group)
-        
-        self.bom_path_label = QtWidgets.QLabel("<no file selected>")
+
+        self.project_bom_group = QtWidgets.QGroupBox(self.ui_tr("project.bom_file"))
+        group_layout = QtWidgets.QHBoxLayout(self.project_bom_group)
+
+        self.bom_path_label = QtWidgets.QLabel(self.ui_tr("project.no_file"))
         group_layout.addWidget(self.bom_path_label, 1)
-        
-        btn = QtWidgets.QPushButton("Browse...")
-        btn.clicked.connect(self._browse_bom)
-        group_layout.addWidget(btn)
-        
-        layout.addWidget(group)
-        
-        # PnP file selection
-        group = QtWidgets.QGroupBox("Pick and Place File")
-        group_layout = QtWidgets.QHBoxLayout(group)
-        
-        self.pnp_path_label = QtWidgets.QLabel("<no file selected>")
+
+        self.btn_browse_bom = QtWidgets.QPushButton(self.ui_tr("project.browse"))
+        self.btn_browse_bom.clicked.connect(self._browse_bom)
+        group_layout.addWidget(self.btn_browse_bom)
+
+        layout.addWidget(self.project_bom_group)
+
+        self.project_pnp_group = QtWidgets.QGroupBox(self.ui_tr("project.pnp_file"))
+        group_layout = QtWidgets.QHBoxLayout(self.project_pnp_group)
+
+        self.pnp_path_label = QtWidgets.QLabel(self.ui_tr("project.no_file"))
         group_layout.addWidget(self.pnp_path_label, 1)
-        
-        btn = QtWidgets.QPushButton("Browse...")
-        btn.clicked.connect(self._browse_pnp)
-        group_layout.addWidget(btn)
-        
-        layout.addWidget(group)
-        
-        # Profile
-        group = QtWidgets.QGroupBox("Profile")
-        group_layout = QtWidgets.QHBoxLayout(group)
-        
-        group_layout.addWidget(QtWidgets.QLabel("Profile:"))
+
+        self.btn_browse_pnp = QtWidgets.QPushButton(self.ui_tr("project.browse"))
+        self.btn_browse_pnp.clicked.connect(self._browse_pnp)
+        group_layout.addWidget(self.btn_browse_pnp)
+
+        layout.addWidget(self.project_pnp_group)
+
+        self.project_settings_group = QtWidgets.QGroupBox(self.ui_tr("project.settings"))
+        settings_layout = QtWidgets.QVBoxLayout(self.project_settings_group)
+
+        row_prof = QtWidgets.QHBoxLayout()
+        self.profile_label = QtWidgets.QLabel(self.ui_tr("project.profile"))
+        row_prof.addWidget(self.profile_label)
         self.profile_combo = QtWidgets.QComboBox()
         self.profile_combo.addItems(["default"])
-        group_layout.addWidget(self.profile_combo)
-        
-        btn = QtWidgets.QPushButton("Clone...")
-        group_layout.addWidget(btn)
-        
-        btn = QtWidgets.QPushButton("Delete")
-        group_layout.addWidget(btn)
-        
-        layout.addWidget(group)
-        
-        # Console log
-        group = QtWidgets.QGroupBox("Console")
-        group_layout = QtWidgets.QVBoxLayout(group)
-        
+        row_prof.addWidget(self.profile_combo)
+        self.btn_profile_clone = QtWidgets.QPushButton(self.ui_tr("project.profile_clone"))
+        row_prof.addWidget(self.btn_profile_clone)
+        self.btn_profile_delete = QtWidgets.QPushButton(self.ui_tr("project.profile_delete"))
+        row_prof.addWidget(self.btn_profile_delete)
+        row_prof.addStretch(1)
+        settings_layout.addLayout(row_prof)
+        self.profile_combo.currentTextChanged.connect(self._on_profile_combo_changed)
+        self.btn_profile_clone.clicked.connect(self._on_profile_clone_clicked)
+        self.btn_profile_delete.clicked.connect(self._on_profile_delete_clicked)
+
+        row_ui = QtWidgets.QHBoxLayout()
+        self.theme_label = QtWidgets.QLabel(self.ui_tr("project.theme"))
+        row_ui.addWidget(self.theme_label)
+        self._theme_button = QtWidgets.QPushButton(self.ui_tr("theme.light"))
+        self._theme_button.setCheckable(True)
+        self._theme_button.setToolTip(self.ui_tr("theme.tooltip"))
+        self._theme_button.clicked.connect(self._toggle_theme)
+        row_ui.addWidget(self._theme_button)
+
+        row_ui.addSpacing(24)
+        self.lang_label = QtWidgets.QLabel(self.ui_tr("project.language"))
+        row_ui.addWidget(self.lang_label)
+        self.lang_combo = QtWidgets.QComboBox()
+        self.lang_combo.addItem("English", "en")
+        self.lang_combo.addItem("Русский", "ru")
+        li = self.lang_combo.findData(self._i18n.locale)
+        self.lang_combo.setCurrentIndex(li if li >= 0 else 0)
+        self.lang_combo.currentIndexChanged.connect(lambda *_: self._on_ui_language_changed())
+        row_ui.addWidget(self.lang_combo)
+        row_ui.addStretch(1)
+        settings_layout.addLayout(row_ui)
+
+        layout.addWidget(self.project_settings_group)
+
+        self.project_console_group = QtWidgets.QGroupBox(self.ui_tr("project.console"))
+        group_layout = QtWidgets.QVBoxLayout(self.project_console_group)
+
         self.console = QtWidgets.QTextEdit()
         self.console.setFont(QtGui.QFont("Consolas", 10))
         self.console.setReadOnly(True)
         group_layout.addWidget(self.console)
-        
-        # Colorful logs checkbox
-        self.chk_colorful = QtWidgets.QCheckBox("Colorful logs")
+
+        self.chk_colorful = QtWidgets.QCheckBox(self.ui_tr("project.colorful_logs"))
         group_layout.addWidget(self.chk_colorful)
-        
-        layout.addWidget(group, 1)
-        
-        # Connect signals
+        self.chk_colorful.toggled.connect(self._on_colorful_logs_toggled)
+
+        layout.addWidget(self.project_console_group, 1)
+
         self.log_message.connect(self._on_log_message)
     
     def _build_mapping_row_widgets(
@@ -223,7 +366,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Spacer (row-number column) + plain widget with combo row. No QScrollArea — it hid combos on some styles."""
         spacer = QtWidgets.QWidget()
         inner = QtWidgets.QWidget()
-        inner.setMinimumHeight(36)
+        inner.setMinimumHeight(26)
         inner.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
         )
@@ -234,13 +377,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _wrap_mapping_row(self, spacer: QtWidgets.QWidget, inner: QtWidgets.QWidget) -> QtWidgets.QWidget:
         row = QtWidgets.QWidget()
-        row.setMinimumHeight(40)
+        row.setMinimumHeight(28)
         h = QtWidgets.QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
         h.addWidget(spacer)
         h.addWidget(inner, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         return row
+
+    def _apply_compact_preview_chrome(self, table: QtWidgets.QTableView) -> None:
+        """Short horizontal header (labels are only 0,1,… in preview); mapping row sits flush above."""
+        hh = table.horizontalHeader()
+        hh.setFixedHeight(_PREVIEW_TABLE_HDR_HEIGHT)
+
+    def _style_mapping_combo(self, combo: QtWidgets.QComboBox) -> None:
+        combo.setMaximumHeight(_MAPPING_COMBO_MAX_HEIGHT)
 
     def _connect_mapping_table_signals(self, table: QtWidgets.QTableView, which: str) -> None:
         vh = table.verticalHeader()
@@ -315,51 +466,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_pnp_all_combos_width()
     
     def _create_bom_tab(self):
-        """Вкладка BOM - просмотр и настройка колонок"""
+        """BOM tab — table view and column mapping."""
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "BOM")
+        self.tabs.addTab(tab, self.ui_tr("tab.bom"))
         
         layout = QtWidgets.QVBoxLayout(tab)
         
+        self.bom_preview_stack = QtWidgets.QWidget()
+        bom_pv = QtWidgets.QVBoxLayout(self.bom_preview_stack)
+        bom_pv.setContentsMargins(0, 0, 0, 0)
+        bom_pv.setSpacing(0)
+
         self.bom_combo_vheader_spacer, self.bom_combo_inner, self.bom_combos_layout = self._build_mapping_row_widgets()
-        layout.addWidget(self._wrap_mapping_row(self.bom_combo_vheader_spacer, self.bom_combo_inner))
+        bom_pv.addWidget(self._wrap_mapping_row(self.bom_combo_vheader_spacer, self.bom_combo_inner))
         
         self.bom_table = QtWidgets.QTableView()
         self.bom_table.setAlternatingRowColors(True)
         self.bom_model = SortableTableModel(pd.DataFrame(), editable=True)
         self.bom_table.setModel(self.bom_model)
         self.bom_table.horizontalHeader().setMinimumSectionSize(48)
+        self._apply_compact_preview_chrome(self.bom_table)
         self.bom_table.horizontalHeader().sectionResized.connect(self._on_bom_section_resized)
         self.bom_model.dataChanged.connect(lambda *args: self._mark_working_dirty("bom"))
         self._connect_mapping_table_signals(self.bom_table, "_bom")
-        layout.addWidget(self.bom_table, 1)
+        bom_pv.addWidget(self.bom_table, 1)
+        layout.addWidget(self.bom_preview_stack, 1)
         
         # Bottom config row
         config = QtWidgets.QFrame()
         config_layout = QtWidgets.QHBoxLayout(config)
-        
-        self.bom_has_headers = QtWidgets.QCheckBox("Has headers")
-        self.bom_has_headers.setChecked(True)
-        self.bom_has_headers.stateChanged.connect(self._on_bom_header_changed)
-        config_layout.addWidget(self.bom_has_headers)
-        
+
         config_layout.addWidget(QtWidgets.QLabel("Separator:"))
         self.bom_separator = QtWidgets.QComboBox()
         self.bom_separator.addItems(["auto", ",", ";", "\\t", "space"])
         self.bom_separator.setCurrentText("auto")
         self.bom_separator.setMinimumWidth(70)
         config_layout.addWidget(self.bom_separator)
-        
-        config_layout.addWidget(QtWidgets.QLabel("1st:"))
+
+        lbl_first = QtWidgets.QLabel("First row:")
+        lbl_first.setToolTip(
+            "First line from file to load (1-based). Also defines the highlighted active row range in the table."
+        )
+        config_layout.addWidget(lbl_first)
         self.bom_first_row = QtWidgets.QLineEdit("1")
-        self.bom_first_row.setMaximumWidth(40)
-        self.bom_first_row.textChanged.connect(lambda: self._refresh_active_row_highlight("bom"))
+        self.bom_first_row.setMaximumWidth(52)
+        self.bom_first_row.setToolTip(
+            "1 = first line of the file after decode. Empty defaults to 1 when loading."
+        )
         config_layout.addWidget(self.bom_first_row)
-        
-        config_layout.addWidget(QtWidgets.QLabel("Last:"))
+
+        lbl_last = QtWidgets.QLabel("Last row:")
+        lbl_last.setToolTip(
+            "Last line to include when loading (1-based, inclusive with First row). Leave empty to read through the end."
+        )
+        config_layout.addWidget(lbl_last)
         self.bom_last_row = QtWidgets.QLineEdit("")
-        self.bom_last_row.setMaximumWidth(40)
-        self.bom_last_row.textChanged.connect(lambda: self._refresh_active_row_highlight("bom"))
+        self.bom_last_row.setMaximumWidth(52)
+        self.bom_last_row.setToolTip(
+            "Last line included in the load range (1-based, inclusive with First row). Empty = through end."
+        )
         config_layout.addWidget(self.bom_last_row)
         
         config_layout.addStretch()
@@ -370,37 +535,71 @@ class MainWindow(QtWidgets.QMainWindow):
         btn = QtWidgets.QPushButton("Reload")
         btn.clicked.connect(self._reload_bom)
         config_layout.addWidget(btn)
-        
+
+        btn_clear_bom = QtWidgets.QPushButton(self.ui_tr("bom.clear_workspace"))
+        btn_clear_bom.setToolTip(self.ui_tr("bom.clear_workspace_tip"))
+        btn_clear_bom.clicked.connect(self._clear_bom_workspace)
+        config_layout.addWidget(btn_clear_bom)
+
         layout.addWidget(config)
+
+        self.bom_separator.currentTextChanged.connect(lambda *_: self._schedule_save_bom_tab_settings())
+        self.bom_first_row.textChanged.connect(self._on_bom_first_last_row_changed)
+        self.bom_last_row.textChanged.connect(self._on_bom_first_last_row_changed)
     
     def _create_pnp_tab(self):
-        """Вкладка PnP"""
+        """PnP tab."""
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "PnP")
+        self.tabs.addTab(tab, self.ui_tr("tab.pnp"))
         
         layout = QtWidgets.QVBoxLayout(tab)
         
+        self.pnp_preview_stack = QtWidgets.QWidget()
+        pnp_pv = QtWidgets.QVBoxLayout(self.pnp_preview_stack)
+        pnp_pv.setContentsMargins(0, 0, 0, 0)
+        pnp_pv.setSpacing(0)
+
         self.pnp_combo_vheader_spacer, self.pnp_combo_inner, self.pnp_combos_layout = self._build_mapping_row_widgets()
-        layout.addWidget(self._wrap_mapping_row(self.pnp_combo_vheader_spacer, self.pnp_combo_inner))
+        pnp_pv.addWidget(self._wrap_mapping_row(self.pnp_combo_vheader_spacer, self.pnp_combo_inner))
         
         self.pnp_table = QtWidgets.QTableView()
         self.pnp_table.setAlternatingRowColors(True)
         self.pnp_model = SortableTableModel(pd.DataFrame(), editable=True)
         self.pnp_table.setModel(self.pnp_model)
         self.pnp_table.horizontalHeader().setMinimumSectionSize(48)
+        self._apply_compact_preview_chrome(self.pnp_table)
         self.pnp_table.horizontalHeader().sectionResized.connect(self._on_pnp_section_resized)
         self.pnp_model.dataChanged.connect(lambda *args: self._mark_working_dirty("pnp"))
         self._connect_mapping_table_signals(self.pnp_table, "_pnp")
-        layout.addWidget(self.pnp_table, 1)
-        
+        pnp_pv.addWidget(self.pnp_table, 1)
+        layout.addWidget(self.pnp_preview_stack, 1)
+
+        coord_row = QtWidgets.QHBoxLayout()
+        btn_clean_xyr = QtWidgets.QPushButton("Clean X/Y/R")
+        btn_clean_xyr.setToolTip(
+            "Strip junk from mapped X, Y, and Rotation columns — keeps digits and decimal separators "
+            "(`.` `,` `-`); does not remove dots inside numbers."
+        )
+        btn_clean_xyr.clicked.connect(self._pnp_clean_xy_rot_columns)
+        coord_row.addWidget(btn_clean_xyr)
+        btn_mm_mil = QtWidgets.QPushButton("MM→MIL")
+        btn_mm_mil.setToolTip(
+            "Convert mapped X and Y from millimeters to mils (explicit edit); four fractional digits."
+        )
+        btn_mm_mil.clicked.connect(self._pnp_convert_xy_mm_to_mil)
+        coord_row.addWidget(btn_mm_mil)
+        btn_mil_mm = QtWidgets.QPushButton("MIL→MM")
+        btn_mil_mm.setToolTip(
+            "Convert mapped X and Y from mils to millimeters (explicit edit); four fractional digits."
+        )
+        btn_mil_mm.clicked.connect(self._pnp_convert_xy_mil_to_mm)
+        coord_row.addWidget(btn_mil_mm)
+        coord_row.addStretch()
+        layout.addLayout(coord_row)
+
         # Bottom config row
         config = QtWidgets.QFrame()
         config_layout = QtWidgets.QHBoxLayout(config)
-        
-        self.pnp_has_headers = QtWidgets.QCheckBox("Has headers")
-        self.pnp_has_headers.setChecked(True)
-        self.pnp_has_headers.stateChanged.connect(self._on_pnp_header_changed)
-        config_layout.addWidget(self.pnp_has_headers)
         
         config_layout.addWidget(QtWidgets.QLabel("Separator:"))
         self.pnp_separator = QtWidgets.QComboBox()
@@ -413,27 +612,47 @@ class MainWindow(QtWidgets.QMainWindow):
             "space = one ASCII space field; "
             "spaces = classic SPACES (any whitespace) like original Boomer; "
             "2+sp = Eagle/cmp: split on 2+ spaces. "
-            "With spaces + Has headers, 1st = header row (DESIGNATOR…); "
-            "with 2+sp, 1st = lines to skip from file start."
+            "First row = first data row to keep (1-based), same as CSV/Excel; "
+            "rows above are skipped and no row is removed as column headers in spaces mode."
         )
         config_layout.addWidget(self.pnp_separator)
-        
-        config_layout.addWidget(QtWidgets.QLabel("1st:"))
+
+        lbl_pfirst = QtWidgets.QLabel("First row:")
+        lbl_pfirst.setToolTip(
+            "First row from file (1-based): first row kept after load (rows above skipped); "
+            "preview shows the full kept grid (column names stay 0,1,2… in spaces mode); "
+            "highlighted range uses these fields."
+        )
+        config_layout.addWidget(lbl_pfirst)
         self.pnp_first_row = QtWidgets.QLineEdit("1")
-        self.pnp_first_row.setMaximumWidth(40)
-        self.pnp_first_row.textChanged.connect(lambda: self._refresh_active_row_highlight("pnp"))
+        self.pnp_first_row.setMaximumWidth(52)
+        self.pnp_first_row.setToolTip("1-based index into the file/grid before trimming.")
         config_layout.addWidget(self.pnp_first_row)
-        
-        config_layout.addWidget(QtWidgets.QLabel("Last:"))
+
+        lbl_plast = QtWidgets.QLabel("Last row:")
+        lbl_plast.setToolTip(
+            "Last row to include when loading (1-based, inclusive with First row). Empty = through end."
+        )
+        config_layout.addWidget(lbl_plast)
         self.pnp_last_row = QtWidgets.QLineEdit("")
-        self.pnp_last_row.setMaximumWidth(40)
-        self.pnp_last_row.textChanged.connect(lambda: self._refresh_active_row_highlight("pnp"))
+        self.pnp_last_row.setMaximumWidth(52)
+        self.pnp_last_row.setToolTip(
+            "Last line included in the load range (1-based, inclusive with First row). Empty = through end."
+        )
         config_layout.addWidget(self.pnp_last_row)
-        
-        config_layout.addWidget(QtWidgets.QLabel("Units:"))
+
+        config_layout.addWidget(QtWidgets.QLabel("Overlap / PCB preview:"))
         self.pnp_units_mm = QtWidgets.QRadioButton("mm")
         self.pnp_units_mils = QtWidgets.QRadioButton("mils")
         self.pnp_units_mm.setChecked(True)
+        self.pnp_units_mm.setToolTip(
+            "PnP X/Y numbers are treated as millimeters when comparing overlap distance on the Report tab "
+            "and when scaling placements for PCB Preview."
+        )
+        self.pnp_units_mils.setToolTip(
+            "PnP X/Y numbers are treated as mils for overlap distance only (×0.0254 vs threshold in mm) "
+            "and for PCB Preview; merge/export/cross-check tables keep raw values."
+        )
         self.pnp_units_mm.toggled.connect(self._on_pnp_units_changed)
         self.pnp_units_mils.toggled.connect(self._on_pnp_units_changed)
         config_layout.addWidget(self.pnp_units_mm)
@@ -447,19 +666,29 @@ class MainWindow(QtWidgets.QMainWindow):
         btn = QtWidgets.QPushButton("Reload")
         btn.clicked.connect(self._reload_pnp)
         config_layout.addWidget(btn)
-        
+
+        btn_clear_pnp = QtWidgets.QPushButton(self.ui_tr("pnp.clear_workspace"))
+        btn_clear_pnp.setToolTip(self.ui_tr("pnp.clear_workspace_tip"))
+        btn_clear_pnp.clicked.connect(self._clear_pnp_workspace)
+        config_layout.addWidget(btn_clear_pnp)
+
         layout.addWidget(config)
-    
+
+        self.pnp_separator.currentTextChanged.connect(lambda *_: self._schedule_save_pnp_tab_settings())
+        self.pnp_first_row.textChanged.connect(self._on_pnp_first_last_row_changed)
+        self.pnp_last_row.textChanged.connect(self._on_pnp_first_last_row_changed)
+
     def _create_clean_tab(self):
-        """Вкладка Clean BOM — нормализация по clean_component + опционально pn_original."""
+        """Clean BOM tab — normalization via clean_component and optional pn_original."""
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Clean BOM")
+        self.tabs.addTab(tab, self.ui_tr("tab.clean_bom"))
         layout = QtWidgets.QVBoxLayout(tab)
 
         clean_intro = QtWidgets.QLabel(
             "Uses the BOM column mapped to «Comment» on the BOM tab. "
             "Import fills the table with raw Comment; Convert! runs classifiers and regex; "
-            "Apply adds _cleaned / clean_* columns."
+            "Apply adds _cleaned / clean_* columns. "
+            "Global settings: From DB, From Hanwha MDB (PARTNAME from Machine lib .mdb), Part numbers (vendor MPN)."
         )
         clean_intro.setToolTip(
             "External hand-made BOMs may prefix THT parts with «DIP_» to mean off-line or "
@@ -474,8 +703,9 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.setColumnStretch(2, 1)
 
         group_global = QtWidgets.QGroupBox("Global settings")
-        glb = QtWidgets.QHBoxLayout(group_global)
-        glb.addWidget(QtWidgets.QLabel("Spacer (join segments):"))
+        glb_outer = QtWidgets.QVBoxLayout(group_global)
+        row_sp = QtWidgets.QHBoxLayout()
+        row_sp.addWidget(QtWidgets.QLabel("Spacer (join segments):"))
         self.clean_spacer_combo = QtWidgets.QComboBox()
         self.clean_spacer_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -489,22 +719,54 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clean_spacer_cust.setPlaceholderText("Custom separator (any string)")
         self.clean_spacer_cust.setEnabled(False)
         self.clean_spacer_cust.setMaximumWidth(220)
-        glb.addWidget(self.clean_spacer_combo, 0)
-        glb.addWidget(self.clean_spacer_cust, 1)
+        row_sp.addWidget(self.clean_spacer_combo, 0)
+        row_sp.addWidget(self.clean_spacer_cust, 1)
         self.clean_prefix_use_separator = QtWidgets.QCheckBox("Use spacer after Prefix")
         self.clean_prefix_use_separator.setChecked(True)
         self.clean_prefix_use_separator.setToolTip(
             "On: Prefix C + spacer '-' + 0402-12PF -> C-0402-12PF. "
             "Off: C0402-12PF."
         )
-        glb.addWidget(self.clean_prefix_use_separator)
+        row_sp.addWidget(self.clean_prefix_use_separator)
+        row_sp.addStretch(1)
+        glb_outer.addLayout(row_sp)
+
+        row_lib = QtWidgets.QHBoxLayout()
         self.clean_from_db = QtWidgets.QCheckBox("From DB")
         self.clean_from_db.setChecked(True)
         self.clean_from_db.setToolTip(
             "On: use components.txt learned components. Off: skip components.txt lookup."
         )
-        glb.addWidget(self.clean_from_db)
-        glb.addStretch(1)
+        row_lib.addWidget(self.clean_from_db)
+        self.clean_from_hanwha_mdb = QtWidgets.QCheckBox("From Hanwha MDB")
+        self.clean_from_hanwha_mdb.setChecked(False)
+        self.clean_from_hanwha_mdb.setToolTip(
+            "Match BOM text to PARTNAME from the .mdb loaded on the Machine lib tab "
+            "(longest substring wins). Load PART_Det first; no match falls through to other rules."
+        )
+        row_lib.addWidget(self.clean_from_hanwha_mdb)
+        row_lib.addStretch(1)
+        glb_outer.addLayout(row_lib)
+
+        self.gb_clean_pn = QtWidgets.QGroupBox("Part numbers (vendor MPN)")
+        self.gb_clean_pn.setCheckable(True)
+        self.gb_clean_pn.setChecked(True)
+        self.gb_clean_pn.setToolTip(
+            "Off: no pn_original MPN decoders (TAI RM/WR, Yageo, Murata, …); only regex. "
+            "On: decoders run first, then fall back to regex. "
+            "The inner checkbox only changes Source: «vendor» vs «pn»."
+        )
+        gl_pn = QtWidgets.QHBoxLayout(self.gb_clean_pn)
+        self.clean_use_vendor = QtWidgets.QCheckBox("Label as «vendor» in Source (not «pn»)")
+        self.clean_use_vendor.setToolTip(
+            "When Part numbers is on, MPN decoders (pn_original) always run first. "
+            "This only controls the Source column: «vendor» vs «pn» for decoded lines."
+        )
+        self.clean_use_vendor.setChecked(False)
+        gl_pn.addWidget(self.clean_use_vendor)
+        gl_pn.addStretch(1)
+        glb_outer.addWidget(self.gb_clean_pn)
+
         grid.addWidget(group_global, 0, 0, 1, 3)
 
         self.gb_clean_res = QtWidgets.QGroupBox("Resistor")
@@ -585,45 +847,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gb_clean_ind.setCheckable(True)
         self.gb_clean_ind.setChecked(True)
         self.gb_clean_ind.setToolTip(
-            "Off: inductor regex is disabled (row stays original when typed as inductor)."
+            "Off: inductor-specific regex is disabled; classified inductor lines use the same path as "
+            "OTHER (vendor MPN for passives, From DB, From Hanwha MDB, then general OTHER regex)."
         )
-        gl = QtWidgets.QVBoxLayout(self.gb_clean_ind)
-        ind_prefix_row = QtWidgets.QHBoxLayout()
-        ind_prefix_row.addWidget(QtWidgets.QLabel("Prefix:"))
+        ind_row = QtWidgets.QHBoxLayout(self.gb_clean_ind)
+        ind_row.setContentsMargins(6, 4, 6, 4)
+        ind_row.setSpacing(6)
+        ind_row.addWidget(QtWidgets.QLabel("Template:"))
+        self.clean_ind_template_combos: list[QtWidgets.QComboBox] = []
+        ind_options = [
+            ("pack", "pack"),
+            ("nom", "nom"),
+            ("%", "%"),
+            ("Imax", "Imax"),
+            ("DCR", "DCR"),
+            ("none", "none"),
+        ]
+        for i, default in enumerate(("pack", "nom", "%", "Imax", "DCR")):
+            ind_row.addWidget(QtWidgets.QLabel(str(i + 1)))
+            combo = QtWidgets.QComboBox()
+            for label, data in ind_options:
+                combo.addItem(label, data)
+            combo.setCurrentIndex(combo.findData(default))
+            combo.setMaximumWidth(82)
+            self.clean_ind_template_combos.append(combo)
+            ind_row.addWidget(combo)
+        ind_row.addWidget(QtWidgets.QLabel("Prefix:"))
         self.clean_ind_prefix = QtWidgets.QLineEdit()
         self.clean_ind_prefix.setPlaceholderText("L")
         self.clean_ind_prefix.setMaximumWidth(54)
-        ind_prefix_row.addWidget(self.clean_ind_prefix)
-        ind_prefix_row.addStretch(1)
-        gl.addLayout(ind_prefix_row)
-        self.clean_ind_pkg = QtWidgets.QCheckBox("Include package")
-        self.clean_ind_i = QtWidgets.QCheckBox("Include current (Irated)")
-        self.clean_ind_tol = QtWidgets.QCheckBox("Include tolerance")
-        for c in (self.clean_ind_pkg, self.clean_ind_i, self.clean_ind_tol):
-            c.setChecked(True)
-        gl.addWidget(self.clean_ind_pkg)
-        gl.addWidget(self.clean_ind_i)
-        gl.addWidget(self.clean_ind_tol)
+        ind_row.addWidget(self.clean_ind_prefix)
+        ind_row.addStretch(1)
         grid.addWidget(self.gb_clean_ind, 1, 2)
-
-        self.gb_clean_pn = QtWidgets.QGroupBox("Part numbers (vendor MPN)")
-        self.gb_clean_pn.setCheckable(True)
-        self.gb_clean_pn.setChecked(True)
-        self.gb_clean_pn.setToolTip(
-            "Off: no pn_original MPN decoders (TAI RM/WR, Yageo, Murata, …); only regex. "
-            "On: decoders run first, then fall back to regex. "
-            "The inner checkbox only changes Source: «vendor» vs «pn»."
-        )
-        gl = QtWidgets.QHBoxLayout(self.gb_clean_pn)
-        self.clean_use_vendor = QtWidgets.QCheckBox("Label as «vendor» in Source (not «pn»)")
-        self.clean_use_vendor.setToolTip(
-            "When Part numbers is on, MPN decoders (pn_original) always run first. "
-            "This only controls the Source column: «vendor» vs «pn» for decoded lines."
-        )
-        self.clean_use_vendor.setChecked(False)
-        gl.addWidget(self.clean_use_vendor)
-        gl.addStretch(1)
-        grid.addWidget(self.gb_clean_pn, 2, 0, 1, 3)
 
         group_mpn_www = QtWidgets.QGroupBox("MPN web lookup")
         mpn_w = QtWidgets.QHBoxLayout(group_mpn_www)
@@ -653,15 +908,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(options)
 
-        for w in (*self.clean_res_template_combos, *self.clean_cap_template_combos):
+        for w in (*self.clean_res_template_combos, *self.clean_cap_template_combos, *self.clean_ind_template_combos):
             w.currentIndexChanged.connect(self._save_clean_settings)
         for w in (
             self.clean_cap_nf,
-            self.clean_ind_pkg,
-            self.clean_ind_i,
-            self.clean_ind_tol,
             self.clean_use_vendor,
             self.clean_from_db,
+            self.clean_from_hanwha_mdb,
         ):
             w.stateChanged.connect(self._save_clean_settings)
         self.gb_clean_res.toggled.connect(self._on_gb_clean_res_toggled)
@@ -916,7 +1169,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_clean_settings()
 
     def _on_gb_clean_ind_toggled(self, on: bool) -> None:
-        for w in (self.clean_ind_pkg, self.clean_ind_i, self.clean_ind_tol, self.clean_ind_prefix):
+        for w in (*self.clean_ind_template_combos, self.clean_ind_prefix):
             w.setEnabled(on)
         self._save_clean_settings()
 
@@ -991,6 +1244,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clean_config_from_ui(self) -> CleanConfig:
         res_template = self._template_from_combos(self.clean_res_template_combos)
         cap_template = self._template_from_combos(self.clean_cap_template_combos)
+        ind_template = self._template_from_combos(self.clean_ind_template_combos)
+        hanwha_names = None
+        if self.clean_from_hanwha_mdb.isChecked() and hasattr(self, "_machine_library_tab"):
+            hs = self._machine_library_tab.hanwha_partname_set()
+            hanwha_names = hs if hs else None
         return CleanConfig(
             resistor_include_package="pack" in res_template,
             resistor_include_tolerance="%" in res_template,
@@ -999,9 +1257,6 @@ class MainWindow(QtWidgets.QMainWindow):
             cap_include_dielectric="film" in cap_template,
             cap_include_tolerance="%" in cap_template,
             cap_convert_nf_to_uf=self.clean_cap_nf.isChecked(),
-            inductor_include_package=self.clean_ind_pkg.isChecked(),
-            inductor_include_current=self.clean_ind_i.isChecked(),
-            inductor_include_tolerance=self.clean_ind_tol.isChecked(),
             use_pn_codecs=self.gb_clean_pn.isChecked(),
             use_vendor_pn=self.gb_clean_pn.isChecked() and self.clean_use_vendor.isChecked(),
             parse_resistors=self.gb_clean_res.isChecked(),
@@ -1010,11 +1265,14 @@ class MainWindow(QtWidgets.QMainWindow):
             output_separator=self._clean_output_separator(),
             resistor_template=res_template,
             cap_template=cap_template,
+            inductor_template=ind_template if ind_template else CleanConfig.inductor_template,
             resistor_prefix=self.clean_res_prefix.text().strip(),
             cap_prefix=self.clean_cap_prefix.text().strip(),
             inductor_prefix=self.clean_ind_prefix.text().strip(),
             prefix_use_separator=self.clean_prefix_use_separator.isChecked(),
             use_component_library=self.clean_from_db.isChecked(),
+            use_hanwha_mdb=self.clean_from_hanwha_mdb.isChecked(),
+            hanwha_partnames=hanwha_names,
         )
 
     def _save_clean_settings(self) -> None:
@@ -1029,10 +1287,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "clean/cap_template",
             ",".join(self._template_from_combos(self.clean_cap_template_combos)),
         )
+        s.setValue(
+            "clean/ind_template",
+            ",".join(self._template_from_combos(self.clean_ind_template_combos)),
+        )
         s.setValue("clean/cap_nf", self.clean_cap_nf.isChecked())
-        s.setValue("clean/ind_pkg", self.clean_ind_pkg.isChecked())
-        s.setValue("clean/ind_i", self.clean_ind_i.isChecked())
-        s.setValue("clean/ind_tol", self.clean_ind_tol.isChecked())
         s.setValue("clean/use_vendor", self.clean_use_vendor.isChecked())
         s.setValue("clean/group_res", self.gb_clean_res.isChecked())
         s.setValue("clean/group_cap", self.gb_clean_cap.isChecked())
@@ -1045,6 +1304,8 @@ class MainWindow(QtWidgets.QMainWindow):
         s.setValue("clean/prefix_use_separator", self.clean_prefix_use_separator.isChecked())
         if hasattr(self, "clean_from_db"):
             s.setValue("clean/from_db", self.clean_from_db.isChecked())
+        if hasattr(self, "clean_from_hanwha_mdb"):
+            s.setValue("clean/from_hanwha_mdb", self.clean_from_hanwha_mdb.isChecked())
         if hasattr(self, "clean_apply_replace"):
             s.setValue("clean/apply_replace", self.clean_apply_replace.isChecked())
 
@@ -1295,14 +1556,47 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
 
     def _create_merge_tab(self):
-        """Вкладка Merge - объединение BOM + PnP"""
+        """Merge tab — combine BOM and PnP."""
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Merge")
+        self.tabs.addTab(tab, self.ui_tr("tab.merge"))
         
         layout = QtWidgets.QVBoxLayout(tab)
         
         info = QtWidgets.QLabel("Merge uses column settings from BOM and PnP tabs")
         layout.addWidget(info)
+
+        self.merge_cc_ok_banner = QtWidgets.QFrame()
+        self.merge_cc_ok_banner.setObjectName("mergeCcOkBanner")
+        self.merge_cc_ok_banner.setVisible(False)
+        self.merge_cc_ok_banner.setStyleSheet(
+            "QFrame#mergeCcOkBanner { background-color: rgba(46, 125, 50, 0.22); "
+            "border: 1px solid #43a047; border-radius: 4px; padding: 6px 8px; }"
+        )
+        cc_ok_lay = QtWidgets.QHBoxLayout(self.merge_cc_ok_banner)
+        cc_ok_lay.setContentsMargins(8, 4, 8, 4)
+        self.merge_cc_ok_icon = QtWidgets.QLabel("\u2713")
+        self.merge_cc_ok_icon.setStyleSheet(
+            "color: #66bb6a; font-size: 22px; font-weight: bold; border: none; background: transparent;"
+        )
+        self.merge_cc_ok_label = QtWidgets.QLabel("PnP is good, ready for Export!")
+        self.merge_cc_ok_label.setStyleSheet(
+            "color: #c8e6c9; font-weight: bold; border: none; background: transparent;"
+        )
+        self.merge_cc_ok_hint = QtWidgets.QLabel(
+            "Cross-check reported no issues — run Merge below, then save or export."
+        )
+        self.merge_cc_ok_hint.setStyleSheet(
+            "color: #a5d6a7; border: none; background: transparent;"
+        )
+        cc_ok_lay.addWidget(self.merge_cc_ok_icon, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        vtxt = QtWidgets.QVBoxLayout()
+        vtxt.setSpacing(0)
+        vtxt.addWidget(self.merge_cc_ok_label)
+        vtxt.addWidget(self.merge_cc_ok_hint)
+        cc_ok_lay.addLayout(vtxt)
+        cc_ok_lay.addStretch()
+        layout.addWidget(self.merge_cc_ok_banner)
+
         # TODO(full Merge): import paired TOP + BOT (see examples/example9) and align with
         # Manual_BOM when present; current UI merges a single loaded BOM+PnP only.
 
@@ -1372,9 +1666,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.merge_table, 1)
     
     def _create_report_tab(self):
-        """Вкладка Cross-Check Report"""
+        """Cross-check report tab."""
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Report")
+        self.tabs.addTab(tab, self.ui_tr("tab.report"))
         
         layout = QtWidgets.QVBoxLayout(tab)
         
@@ -1390,7 +1684,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_copy_html.setToolTip("Copy last cross-check result as HTML")
         self.btn_copy_html.clicked.connect(self._copy_report_html)
         buttons.addWidget(self.btn_copy_html)
-        
+
+        self.btn_save_report_html = QtWidgets.QPushButton("Save HTML report…")
+        self.btn_save_report_html.setEnabled(False)
+        self.btn_save_report_html.setToolTip(
+            "Save last cross-check report as a standalone .html file (same styling as Copy HTML)"
+        )
+        self.btn_save_report_html.clicked.connect(self._save_report_html)
+        buttons.addWidget(self.btn_save_report_html)
+
         buttons.addStretch()
         
         # Filter checkboxes
@@ -1412,9 +1714,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_overlap = QtWidgets.QCheckBox("Overlap: min center distance (mm)")
         self.chk_overlap.setChecked(False)
         self.chk_overlap.setToolTip(
-            "If enabled, report pairs of placements on the same side with center distance below this "
-            "threshold (default 3 mm, like boomer.ini components_min_distance). This is O(n²) in PnP size — "
-            "leave off for very dense panels."
+            "If enabled, report pairs of placements on the same layer when center distance (after scaling "
+            "PnP X/Y per the **PnP tab** mm/mils toggle) is below this threshold. Distance limit is always "
+            "in millimeters. O(n²) in PnP size — leave off for very dense panels."
         )
         self.spin_overlap_mm = QtWidgets.QDoubleSpinBox()
         self.spin_overlap_mm.setRange(0.1, 999.0)
@@ -1439,8 +1741,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _create_pcb_preview_tab(self) -> None:
         self._pcb_tab = PcbPreviewTab(self)
-        self.tabs.addTab(self._pcb_tab, "PCB Preview")
+        self.tabs.addTab(self._pcb_tab, self.ui_tr("tab.pcb_preview"))
         self.tabs.currentChanged.connect(self._on_main_tab_changed)
+
+    def _create_machine_library_tab(self) -> None:
+        self._machine_library_tab = MachineLibraryTab(self)
+        self.tabs.addTab(self._machine_library_tab, self.ui_tr("tab.machine_lib"))
 
     def _on_main_tab_changed(self, idx: int) -> None:
         if self.tabs.widget(idx) is getattr(self, "_pcb_tab", None):
@@ -1500,29 +1806,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._load_pnp(path)
     
     def _recover_snapshot_choice(self, path: str, kind: str) -> pd.DataFrame | None | str:
-        snap = find_snapshot(path, kind, self._autosave_dir)
-        if snap is None or not bool(snap.meta.get("dirty", False)):
-            return None
-        source = snap.meta.get("source") or {}
-        saved_at = str(snap.meta.get("saved_at", ""))
-        msg = QtWidgets.QMessageBox(self)
-        msg.setWindowTitle("Recovered working copy found")
-        msg.setText(
-            f"Recovered edited {kind.upper()} copy found for:\n{source.get('name', path)}\n\n"
-            f"Saved at: {saved_at}\n\nOpen recovered copy or original?"
-        )
-        recovered_btn = msg.addButton("Recovered", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        original_btn = msg.addButton("Original", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
-        cancel_btn = msg.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
-        msg.exec()
-        clicked = msg.clickedButton()
-        if clicked == recovered_btn:
-            return snap.dataframe
-        if clicked == original_btn:
-            return None
-        if clicked == cancel_btn:
-            return "cancel"
-        return "cancel"
+        return prompt_recover_snapshot(self, path, kind, self._autosave_dir)
 
     def _confirm_reload_original(self, kind: str) -> bool:
         dirty = self._bom_dirty if kind == "bom" else self._pnp_dirty
@@ -1544,6 +1828,8 @@ class MainWindow(QtWidgets.QMainWindow):
             recovered = None if force_original else self._recover_snapshot_choice(path, "bom")
             if isinstance(recovered, str) and recovered == "cancel":
                 return
+            if not isinstance(recovered, pd.DataFrame):
+                self._restore_bom_tab_load_params(path)
             sep = self.bom_separator.currentText()
             first = int(self.bom_first_row.text() or 1) - 1  # 0-based
             last_text = self.bom_last_row.text()
@@ -1554,7 +1840,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._bom_dirty = True
                 recovered_note = "recovered working copy"
             else:
-                self._bom_df = read_file(path, first_row=first, last_row=last, separator=sep)
+                self._bom_df = read_file(
+                    path,
+                    first_row=first,
+                    last_row=last,
+                    separator=sep,
+                    column_headers_from_file=False,
+                )
                 self._bom_dirty = False
                 recovered_note = "original file"
             self._bom_source_path = path
@@ -1564,6 +1856,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._loading_working_copy = False
             self._refresh_active_row_highlight("bom")
             self._fill_bom_combos()
+            self._restore_bom_mappings_after_fill(path)
             QtCore.QTimer.singleShot(0, self._autoresize_bom_columns)
             
             if path not in self._recent_bom:
@@ -1576,7 +1869,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 "info",
             )
             self._log(f"Columns: {list(self._bom_df.columns)}", "debug")
-            self._save_last_file_paths()
             if force_original:
                 save_snapshot(
                     self._bom_df,
@@ -1585,6 +1877,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._autosave_dir,
                     dirty=False,
                 )
+            QtCore.QTimer.singleShot(0, self._save_bom_tab_settings_to_disk)
+            self._hide_merge_cross_check_ok_banner()
         except SMTProcessorError as e:
             self._log(f"Error loading BOM: {e}", "error")
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
@@ -1597,6 +1891,8 @@ class MainWindow(QtWidgets.QMainWindow):
             recovered = None if force_original else self._recover_snapshot_choice(path, "pnp")
             if isinstance(recovered, str) and recovered == "cancel":
                 return
+            if not isinstance(recovered, pd.DataFrame):
+                self._restore_pnp_tab_load_params(path)
             sep = self.pnp_separator.currentText()
             first = int(self.pnp_first_row.text() or 1) - 1
             last_text = self.pnp_last_row.text()
@@ -1607,28 +1903,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._pnp_dirty = True
                 recovered_note = "recovered working copy"
             else:
-                # Classic Boomer (app.py) SPACES / *sp: str.split() per line, same as csv_reader.
-                # 1st points at the *header* row in the tabular grid (when Has headers), not at Eagle data line.
                 if sep == "spaces":
                     self._pnp_df = read_text_whitespace_sp(path)
+                    self._pnp_df = _clean_empty_rows(self._pnp_df)
                     if self._pnp_df.empty:
                         raise SMTEmptyDataError(f"No data rows in {path!r} (spaces mode)")
-                    if self.pnp_has_headers.isChecked():
-                        if first < 0 or first >= len(self._pnp_df):
-                            raise SMTProcessorError(
-                                f"1st (header row) is out of range: need 1..{len(self._pnp_df)} in grid after filters"
-                            )
-                        self._pnp_df = apply_row_as_column_header(self._pnp_df, first)
+                    n = len(self._pnp_df)
+                    if first >= n:
+                        self._pnp_df = self._pnp_df.iloc[0:0].copy()
+                    elif last < 0:
+                        self._pnp_df = self._pnp_df.iloc[first:].copy().reset_index(drop=True)
+                    elif last < first:
+                        self._pnp_df = self._pnp_df.iloc[0:0].copy()
                     else:
-                        if first > 0 and first < len(self._pnp_df):
-                            self._pnp_df = self._pnp_df.iloc[first:].reset_index(drop=True)
-                    if last > 0 and last < len(self._pnp_df):
-                        self._pnp_df = self._pnp_df.iloc[:last].reset_index(drop=True)
-                    self._pnp_df = _clean_empty_rows(self._pnp_df)
+                        end = min(last + 1, n)
+                        self._pnp_df = self._pnp_df.iloc[first:end].copy().reset_index(drop=True)
                     if self._pnp_df.empty:
                         raise SMTEmptyDataError(f"No data after trim in {path!r} (spaces mode)")
                 else:
-                    self._pnp_df = read_file(path, first_row=first, last_row=last, separator=sep)
+                    self._pnp_df = read_file(
+                        path,
+                        first_row=first,
+                        last_row=last,
+                        separator=sep,
+                        column_headers_from_file=False,
+                    )
                 self._pnp_dirty = False
                 recovered_note = "original file"
             self._pnp_source_path = path
@@ -1638,6 +1937,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._loading_working_copy = False
             self._refresh_active_row_highlight("pnp")
             self._fill_pnp_combos()
+            self._restore_pnp_mappings_after_fill(path)
             QtCore.QTimer.singleShot(0, self._autoresize_pnp_columns)
             
             if path not in self._recent_pnp:
@@ -1650,7 +1950,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 "info",
             )
             self._log(f"Columns: {list(self._pnp_df.columns)}", "debug")
-            self._save_last_file_paths()
             if force_original:
                 save_snapshot(
                     self._pnp_df,
@@ -1659,6 +1958,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._autosave_dir,
                     dirty=False,
                 )
+            QtCore.QTimer.singleShot(0, self._save_pnp_tab_settings_to_disk)
+            self._hide_merge_cross_check_ok_banner()
         except SMTProcessorError as e:
             self._log(f"Error loading PnP: {e}", "error")
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
@@ -1683,7 +1984,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_theme = DARK_THEME if dark else LIGHT_THEME
         self._theme_button.blockSignals(True)
         self._theme_button.setChecked(dark)
-        self._theme_button.setText("🌙 Dark" if dark else "☀ Light")
+        self._theme_button.setText(
+            self.ui_tr("theme.dark" if dark else "theme.light")
+        )
+        self._theme_button.setToolTip(self.ui_tr("theme.tooltip"))
         self._theme_button.blockSignals(False)
         if save and hasattr(self, "_settings"):
             self._settings.setValue("ui/dark_theme", dark)
@@ -1700,17 +2004,469 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._settings.setValue("pnp/units", "mils" if self.pnp_units_mils.isChecked() else "mm")
 
+    def _on_colorful_logs_toggled(self, *_args) -> None:
+        if self._restoring_settings or not hasattr(self, "_settings"):
+            return
+        self._settings.setValue("ui/colorful_logs", self.chk_colorful.isChecked())
+
+    @staticmethod
+    def _sanitize_profile_id(name: str) -> str:
+        t = (name or "").strip().replace(" ", "_")
+        if not t:
+            return "default"
+        out = re.sub(r"[^a-zA-Z0-9_-]", "", t)
+        return out[:64] or "default"
+
+    def _current_profile_id(self) -> str:
+        return self._sanitize_profile_id(self.profile_combo.currentText())
+
+    def _load_profile_combo_from_storage(self) -> None:
+        s = self._settings
+        raw = str(s.value(PROFILE_NAMES_KEY, "") or "").strip()
+        names: list[str] = ["default"]
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list) and parsed:
+                    names = [str(x) for x in parsed]
+            except json.JSONDecodeError:
+                pass
+        names = [self._sanitize_profile_id(x) for x in names]
+        if "default" not in names:
+            names.insert(0, "default")
+        last = self._sanitize_profile_id(str(s.value(PROFILE_LAST_ACTIVE_KEY, "default") or "default"))
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        for n in names:
+            if self.profile_combo.findText(n) < 0:
+                self.profile_combo.addItem(n)
+        idx = self.profile_combo.findText(last)
+        self.profile_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.profile_combo.blockSignals(False)
+
+    def _gather_clean_prefs_payload(self) -> dict[str, Any]:
+        if not hasattr(self, "clean_res_template_combos"):
+            return {}
+        prov = "digikey"
+        if hasattr(self, "clean_mpn_search_provider"):
+            prov = self.clean_mpn_search_provider.currentData() or "digikey"
+        key = str(prov) if prov is not None else "digikey"
+        return {
+            "res_template": ",".join(self._template_from_combos(self.clean_res_template_combos)),
+            "cap_template": ",".join(self._template_from_combos(self.clean_cap_template_combos)),
+            "ind_template": ",".join(self._template_from_combos(self.clean_ind_template_combos)),
+            "cap_nf": self.clean_cap_nf.isChecked(),
+            "use_vendor": self.clean_use_vendor.isChecked(),
+            "from_db": self.clean_from_db.isChecked(),
+            "from_hanwha_mdb": self.clean_from_hanwha_mdb.isChecked(),
+            "prefix_use_separator": self.clean_prefix_use_separator.isChecked(),
+            "res_prefix": self.clean_res_prefix.text(),
+            "cap_prefix": self.clean_cap_prefix.text(),
+            "ind_prefix": self.clean_ind_prefix.text(),
+            "apply_replace": self.clean_apply_replace.isChecked(),
+            "group_res": self.gb_clean_res.isChecked(),
+            "group_cap": self.gb_clean_cap.isChecked(),
+            "group_ind": self.gb_clean_ind.isChecked(),
+            "group_pn": self.gb_clean_pn.isChecked(),
+            "output_separator": self._clean_output_separator(),
+            "mpn_search_provider": key,
+            "octopart_api_key": self.clean_octopart_api_key.text()
+            if hasattr(self, "clean_octopart_api_key")
+            else "",
+        }
+
+    def _apply_clean_prefs_dict(self, c: dict[str, Any]) -> None:
+        if not hasattr(self, "clean_res_template_combos"):
+            return
+        if hasattr(self, "gb_clean_res"):
+            for gb in (
+                self.gb_clean_res,
+                self.gb_clean_cap,
+                self.gb_clean_ind,
+                self.gb_clean_pn,
+            ):
+                gb.blockSignals(True)
+        for w in (
+            *self.clean_res_template_combos,
+            *self.clean_cap_template_combos,
+            *self.clean_ind_template_combos,
+            self.clean_cap_nf,
+            self.clean_use_vendor,
+            self.clean_from_db,
+            self.clean_from_hanwha_mdb,
+            self.clean_prefix_use_separator,
+            self.clean_res_prefix,
+            self.clean_cap_prefix,
+            self.clean_ind_prefix,
+            self.clean_apply_replace,
+        ):
+            w.blockSignals(True)
+        self._set_template_combos(
+            self.clean_res_template_combos,
+            str(c.get("res_template", "nom,pack,watt,%")),
+            ("nom", "pack", "watt", "%"),
+        )
+        self._set_template_combos(
+            self.clean_cap_template_combos,
+            str(c.get("cap_template", "nom,pack,film,%,W")),
+            ("nom", "pack", "film", "%", "W"),
+        )
+        self._set_template_combos(
+            self.clean_ind_template_combos,
+            str(c.get("ind_template", "pack,nom,%,Imax,DCR")),
+            ("pack", "nom", "%", "Imax", "DCR"),
+        )
+        self.clean_cap_nf.setChecked(bool(c.get("cap_nf", False)))
+        self.clean_use_vendor.setChecked(bool(c.get("use_vendor", False)))
+        self.clean_from_db.setChecked(bool(c.get("from_db", True)))
+        self.clean_from_hanwha_mdb.setChecked(bool(c.get("from_hanwha_mdb", False)))
+        self.clean_prefix_use_separator.setChecked(bool(c.get("prefix_use_separator", True)))
+        self.clean_res_prefix.setText(str(c.get("res_prefix", "")))
+        self.clean_cap_prefix.setText(str(c.get("cap_prefix", "")))
+        self.clean_ind_prefix.setText(str(c.get("ind_prefix", "")))
+        self.clean_apply_replace.setChecked(bool(c.get("apply_replace", False)))
+        if hasattr(self, "gb_clean_res"):
+            self.gb_clean_res.setChecked(bool(c.get("group_res", True)))
+            self.gb_clean_cap.setChecked(bool(c.get("group_cap", True)))
+            self.gb_clean_ind.setChecked(bool(c.get("group_ind", True)))
+            self.gb_clean_pn.setChecked(bool(c.get("group_pn", True)))
+        self.clean_spacer_combo.blockSignals(True)
+        self.clean_spacer_cust.blockSignals(True)
+        self._apply_clean_spacer_to_ui(str(c.get("output_separator", "_")))
+        self.clean_spacer_combo.blockSignals(False)
+        self.clean_spacer_cust.blockSignals(False)
+        for w in (
+            *self.clean_res_template_combos,
+            *self.clean_cap_template_combos,
+            *self.clean_ind_template_combos,
+            self.clean_cap_nf,
+            self.clean_use_vendor,
+            self.clean_from_db,
+            self.clean_from_hanwha_mdb,
+            self.clean_prefix_use_separator,
+            self.clean_res_prefix,
+            self.clean_cap_prefix,
+            self.clean_ind_prefix,
+            self.clean_apply_replace,
+        ):
+            w.blockSignals(False)
+        if hasattr(self, "clean_mpn_search_provider"):
+            self.clean_mpn_search_provider.blockSignals(True)
+            self.clean_octopart_api_key.blockSignals(True)
+            prov = str(c.get("mpn_search_provider", "digikey"))
+            for i in range(self.clean_mpn_search_provider.count()):
+                if self.clean_mpn_search_provider.itemData(i) == prov:
+                    self.clean_mpn_search_provider.setCurrentIndex(i)
+                    break
+            self.clean_octopart_api_key.setText(str(c.get("octopart_api_key", "")))
+            self.clean_mpn_search_provider.blockSignals(False)
+            self.clean_octopart_api_key.blockSignals(False)
+        if hasattr(self, "gb_clean_res"):
+            for gb in (
+                self.gb_clean_res,
+                self.gb_clean_cap,
+                self.gb_clean_ind,
+                self.gb_clean_pn,
+            ):
+                gb.blockSignals(False)
+            self._on_gb_clean_res_toggled(self.gb_clean_res.isChecked())
+            self._on_gb_clean_cap_toggled(self.gb_clean_cap.isChecked())
+            self._on_gb_clean_ind_toggled(self.gb_clean_ind.isChecked())
+            self._on_gb_clean_pn_toggled(self.gb_clean_pn.isChecked())
+
+    def _gather_profile_payload(self) -> dict[str, Any]:
+        bom_maps: list[str] = []
+        if getattr(self, "bom_col_combos", None):
+            bom_maps = [x.currentText() for x in self.bom_col_combos]
+        pnp_maps: list[str] = []
+        if getattr(self, "pnp_col_combos", None):
+            pnp_maps = [x.currentText() for x in self.pnp_col_combos]
+        pcb: dict[str, Any] = {}
+        if hasattr(self, "_pcb_tab") and hasattr(self._pcb_tab, "export_ui_prefs"):
+            pcb = self._pcb_tab.export_ui_prefs()
+        lang = "en"
+        if hasattr(self, "lang_combo"):
+            lang = str(self.lang_combo.currentData() or "en")
+        return {
+            "v": PROFILE_STATE_VERSION,
+            "ui": {
+                "language": lang if lang in ("en", "ru") else "en",
+                "dark_theme": bool(self._theme_button.isChecked()),
+                "colorful_logs": self.chk_colorful.isChecked() if hasattr(self, "chk_colorful") else True,
+            },
+            "bom": {
+                "separator": self.bom_separator.currentText(),
+                "first_row": self.bom_first_row.text(),
+                "last_row": self.bom_last_row.text(),
+                "mappings": bom_maps,
+            },
+            "pnp": {
+                "separator": self.pnp_separator.currentText(),
+                "first_row": self.pnp_first_row.text(),
+                "last_row": self.pnp_last_row.text(),
+                "units": "mils" if self.pnp_units_mils.isChecked() else "mm",
+                "mappings": pnp_maps,
+            },
+            "merge": {"delete_dnp": self.merge_delete_dnp.isChecked()},
+            "report": {
+                "show_critical": self.chk_critical.isChecked(),
+                "show_warning": self.chk_warning.isChecked(),
+                "show_info": self.chk_info.isChecked(),
+                "overlap": self.chk_overlap.isChecked(),
+                "overlap_mm": float(self.spin_overlap_mm.value()),
+            },
+            "clean": self._gather_clean_prefs_payload(),
+            "pcb_preview": pcb,
+        }
+
+    def _apply_profile_payload(self, data: dict[str, Any]) -> None:
+        ui = data.get("ui") or {}
+        lang = str(ui.get("language", "en"))
+        if lang not in ("en", "ru"):
+            lang = "en"
+        self._apply_theme(bool(ui.get("dark_theme", False)), save=False)
+        if hasattr(self, "chk_colorful"):
+            self.chk_colorful.setChecked(bool(ui.get("colorful_logs", True)))
+        bom = data.get("bom") or {}
+        bsep = str(bom.get("separator", "auto"))
+        if self.bom_separator.findText(bsep) >= 0:
+            self.bom_separator.setCurrentText(bsep)
+        self.bom_first_row.setText(str(bom.get("first_row", "1")))
+        self.bom_last_row.setText(str(bom.get("last_row", "")))
+        bm = bom.get("mappings")
+        self._profile_restore_bom_mappings = (
+            [str(x) for x in bm] if isinstance(bm, list) else None
+        )
+        pnp = data.get("pnp") or {}
+        psep = str(pnp.get("separator", "auto"))
+        if self.pnp_separator.findText(psep) >= 0:
+            self.pnp_separator.setCurrentText(psep)
+        self.pnp_first_row.setText(str(pnp.get("first_row", "1")))
+        self.pnp_last_row.setText(str(pnp.get("last_row", "")))
+        if str(pnp.get("units", "mm")).lower() == "mils":
+            self.pnp_units_mils.setChecked(True)
+        else:
+            self.pnp_units_mm.setChecked(True)
+        pm = pnp.get("mappings")
+        self._profile_restore_pnp_mappings = (
+            [str(x) for x in pm] if isinstance(pm, list) else None
+        )
+        merge = data.get("merge") or {}
+        self.merge_delete_dnp.setChecked(bool(merge.get("delete_dnp", False)))
+        rep = data.get("report") or {}
+        self.chk_critical.setChecked(bool(rep.get("show_critical", True)))
+        self.chk_warning.setChecked(bool(rep.get("show_warning", True)))
+        self.chk_info.setChecked(bool(rep.get("show_info", True)))
+        self.chk_overlap.blockSignals(True)
+        self.spin_overlap_mm.blockSignals(True)
+        self.chk_overlap.setChecked(bool(rep.get("overlap", False)))
+        self.spin_overlap_mm.setValue(float(rep.get("overlap_mm", 3.0)))
+        self.spin_overlap_mm.setEnabled(self.chk_overlap.isChecked())
+        self.spin_overlap_mm.blockSignals(False)
+        self.chk_overlap.blockSignals(False)
+        clean = data.get("clean")
+        if isinstance(clean, dict) and clean:
+            self._apply_clean_prefs_dict(clean)
+        pcb = data.get("pcb_preview")
+        if isinstance(pcb, dict) and hasattr(self, "_pcb_tab"):
+            self._pcb_tab.apply_ui_prefs(pcb)
+        if hasattr(self, "lang_combo"):
+            self.lang_combo.blockSignals(True)
+            li = self.lang_combo.findData(lang)
+            if li >= 0:
+                self.lang_combo.setCurrentIndex(li)
+            self.lang_combo.blockSignals(False)
+        self._apply_ui_language(lang, save=False)
+        self._refresh_active_row_highlight("bom")
+        self._refresh_active_row_highlight("pnp")
+
+    def _save_full_profile_snapshot(self) -> None:
+        if not hasattr(self, "_settings"):
+            return
+        self._save_clean_settings()
+        if hasattr(self, "_save_clean_mpn_lookup_settings"):
+            self._save_clean_mpn_lookup_settings()
+        self._save_report_overlap_settings()
+        if hasattr(self, "chk_critical"):
+            self._settings.setValue("report/show_critical", self.chk_critical.isChecked())
+            self._settings.setValue("report/show_warning", self.chk_warning.isChecked())
+            self._settings.setValue("report/show_info", self.chk_info.isChecked())
+        pid = self._current_profile_id()
+        payload = self._gather_profile_payload()
+        self._settings.setValue(f"profiles/{pid}/state_json", json.dumps(payload, ensure_ascii=False))
+        self._settings.setValue(PROFILE_LAST_ACTIVE_KEY, pid)
+        names = [self.profile_combo.itemText(i) for i in range(self.profile_combo.count())]
+        self._settings.setValue(PROFILE_NAMES_KEY, json.dumps(names))
+        self._settings.remove("files/last_bom")
+        self._settings.remove("files/last_pnp")
+
+    def _clear_bom_workspace(self) -> None:
+        self._bom_df = None
+        self._bom_source_path = ""
+        self._bom_dirty = False
+        self._loading_working_copy = True
+        self.bom_model.update_dataframe(pd.DataFrame())
+        self._loading_working_copy = False
+        while self.bom_combos_layout.count():
+            item = self.bom_combos_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.bom_col_combos = []
+        self.bom_path_label.setText(self.ui_tr("project.no_file"))
+        self._refresh_active_row_highlight("bom")
+        self._hide_merge_cross_check_ok_banner()
+        self._profile_restore_bom_mappings = None
+        self._log(self.ui_tr("msg.bom_cleared"), "info")
+
+    def _clear_pnp_workspace(self) -> None:
+        self._pnp_df = None
+        self._pnp_source_path = ""
+        self._pnp_dirty = False
+        self._loading_working_copy = True
+        self.pnp_model.update_dataframe(pd.DataFrame())
+        self._loading_working_copy = False
+        while self.pnp_combos_layout.count():
+            item = self.pnp_combos_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.pnp_col_combos = []
+        self.pnp_path_label.setText(self.ui_tr("project.no_file"))
+        self._refresh_active_row_highlight("pnp")
+        self._hide_merge_cross_check_ok_banner()
+        self._profile_restore_pnp_mappings = None
+        self._refresh_pcb_preview_from_ui()
+        self._log(self.ui_tr("msg.pnp_cleared"), "info")
+
+    def _apply_pending_profile_bom_mappings(self) -> None:
+        pm = getattr(self, "_profile_restore_bom_mappings", None)
+        if not pm or not getattr(self, "bom_col_combos", None):
+            return
+        if len(pm) != len(self.bom_col_combos):
+            return
+        self._bom_ui_restoring = True
+        try:
+            for i, txt in enumerate(pm):
+                if isinstance(txt, str) and self.bom_col_combos[i].findText(txt) >= 0:
+                    self.bom_col_combos[i].setCurrentText(txt)
+        finally:
+            self._bom_ui_restoring = False
+        self._profile_restore_bom_mappings = None
+
+    def _apply_pending_profile_pnp_mappings(self) -> None:
+        pm = getattr(self, "_profile_restore_pnp_mappings", None)
+        if not pm or not getattr(self, "pnp_col_combos", None):
+            return
+        if len(pm) != len(self.pnp_col_combos):
+            return
+        self._pnp_ui_restoring = True
+        try:
+            for i, txt in enumerate(pm):
+                if isinstance(txt, str) and self.pnp_col_combos[i].findText(txt) >= 0:
+                    self.pnp_col_combos[i].setCurrentText(txt)
+        finally:
+            self._pnp_ui_restoring = False
+        self._profile_restore_pnp_mappings = None
+
+    def _on_profile_combo_changed(self, _text: str) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        pid = self._current_profile_id()
+        self._settings.setValue(PROFILE_LAST_ACTIVE_KEY, pid)
+        raw = str(self._settings.value(f"profiles/{pid}/state_json", "") or "").strip()
+        if not raw:
+            self._log(self.ui_tr("msg.profile_empty_kept_ui", name=pid), "info")
+            return
+        try:
+            self._restoring_settings = True
+            self._apply_profile_payload(json.loads(raw))
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            self._log(self.ui_tr("msg.profile_load_failed", err=str(e)), "warning")
+        finally:
+            self._restoring_settings = False
+
+    def _on_profile_clone_clicked(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            self.ui_tr("project.profile_clone"),
+            self.ui_tr("msg.profile_clone_prompt"),
+        )
+        if not ok:
+            return
+        pid = self._sanitize_profile_id(name)
+        if pid == "default":
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.ui_tr("project.profile_clone"),
+                self.ui_tr("msg.profile_reserved_default"),
+            )
+            return
+        if self.profile_combo.findText(pid) >= 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.ui_tr("project.profile_clone"),
+                self.ui_tr("msg.profile_exists", name=pid),
+            )
+            return
+        src = self._current_profile_id()
+        blob = self._settings.value(f"profiles/{src}/state_json", "")
+        self._settings.setValue(f"profiles/{pid}/state_json", blob)
+        self.profile_combo.addItem(pid)
+        self.profile_combo.setCurrentText(pid)
+        self._log(self.ui_tr("msg.profile_cloned", src=src, dst=pid), "info")
+
+    def _on_profile_delete_clicked(self) -> None:
+        pid = self._current_profile_id()
+        if pid == "default":
+            QtWidgets.QMessageBox.information(
+                self,
+                self.ui_tr("project.profile_delete"),
+                self.ui_tr("msg.profile_cannot_delete_default"),
+            )
+            return
+        res = QtWidgets.QMessageBox.question(
+            self,
+            self.ui_tr("project.profile_delete"),
+            self.ui_tr("msg.profile_delete_confirm", name=pid),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if res != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._settings.remove(f"profiles/{pid}/state_json")
+        idx = self.profile_combo.currentIndex()
+        self.profile_combo.removeItem(idx)
+        self.profile_combo.setCurrentText("default")
+        names = [self.profile_combo.itemText(i) for i in range(self.profile_combo.count())]
+        self._settings.setValue(PROFILE_NAMES_KEY, json.dumps(names))
+        self._log(self.ui_tr("msg.profile_deleted", name=pid), "info")
+
     def _load_settings(self) -> None:
         self._restoring_settings = True
         s = self._settings
         try:
-            dark = s.value("ui/dark_theme", False, type=bool)
-            self._apply_theme(dark, save=False)
-            if hasattr(self, "merge_delete_dnp") and s.contains("merge/delete_dnp"):
-                self.merge_delete_dnp.setChecked(
-                    s.value("merge/delete_dnp", False, type=bool)
-                )
-            if hasattr(self, "clean_res_template_combos"):
+            self._load_profile_combo_from_storage()
+            pid = self._current_profile_id()
+            blob = str(s.value(f"profiles/{pid}/state_json", "") or "").strip()
+            loaded = False
+            if blob:
+                try:
+                    self._apply_profile_payload(json.loads(blob))
+                    loaded = True
+                except (json.JSONDecodeError, TypeError, ValueError) as e:
+                    logger.warning("Profile state invalid (%s); using legacy flat keys", e)
+            if not loaded:
+                self._load_legacy_settings_flat(s)
+        finally:
+            self._restoring_settings = False
+
+    def _load_legacy_settings_flat(self, s: QSettings) -> None:
+        dark = s.value("ui/dark_theme", False, type=bool)
+        self._apply_theme(dark, save=False)
+        if hasattr(self, "chk_colorful"):
+            self.chk_colorful.setChecked(s.value("ui/colorful_logs", True, type=bool))
+        if hasattr(self, "merge_delete_dnp") and s.contains("merge/delete_dnp"):
+            self.merge_delete_dnp.setChecked(s.value("merge/delete_dnp", False, type=bool))
+        if hasattr(self, "clean_res_template_combos"):
                 if hasattr(self, "gb_clean_res"):
                     for gb in (
                         self.gb_clean_res,
@@ -1722,12 +2478,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 for w in (
                     *self.clean_res_template_combos,
                     *self.clean_cap_template_combos,
+                    *self.clean_ind_template_combos,
                     self.clean_cap_nf,
-                    self.clean_ind_pkg,
-                    self.clean_ind_i,
-                    self.clean_ind_tol,
                     self.clean_use_vendor,
                     self.clean_from_db,
+                    self.clean_from_hanwha_mdb,
                     self.clean_prefix_use_separator,
                     self.clean_res_prefix,
                     self.clean_cap_prefix,
@@ -1741,6 +2496,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 cap_template = s.value(
                     "clean/cap_template", "nom,pack,film,%,W", str
                 )
+                ind_template = s.value(
+                    "clean/ind_template", "pack,nom,%,Imax,DCR", str
+                )
                 self._set_template_combos(
                     self.clean_res_template_combos,
                     res_template,
@@ -1751,23 +2509,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     cap_template,
                     ("nom", "pack", "film", "%", "W"),
                 )
+                self._set_template_combos(
+                    self.clean_ind_template_combos,
+                    ind_template,
+                    ("pack", "nom", "%", "Imax", "DCR"),
+                )
                 self.clean_cap_nf.setChecked(
                     s.value("clean/cap_nf", False, type=bool)
-                )
-                self.clean_ind_pkg.setChecked(
-                    s.value("clean/ind_pkg", True, type=bool)
-                )
-                self.clean_ind_i.setChecked(
-                    s.value("clean/ind_i", True, type=bool)
-                )
-                self.clean_ind_tol.setChecked(
-                    s.value("clean/ind_tol", True, type=bool)
                 )
                 self.clean_use_vendor.setChecked(
                     s.value("clean/use_vendor", False, type=bool)
                 )
                 self.clean_from_db.setChecked(
                     s.value("clean/from_db", True, type=bool)
+                )
+                self.clean_from_hanwha_mdb.setChecked(
+                    s.value("clean/from_hanwha_mdb", False, type=bool)
                 )
                 self.clean_prefix_use_separator.setChecked(
                     s.value("clean/prefix_use_separator", True, type=bool)
@@ -1806,12 +2563,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 for w in (
                     *self.clean_res_template_combos,
                     *self.clean_cap_template_combos,
+                    *self.clean_ind_template_combos,
                     self.clean_cap_nf,
-                    self.clean_ind_pkg,
-                    self.clean_ind_i,
-                    self.clean_ind_tol,
                     self.clean_use_vendor,
                     self.clean_from_db,
+                    self.clean_from_hanwha_mdb,
                     self.clean_prefix_use_separator,
                     self.clean_res_prefix,
                     self.clean_cap_prefix,
@@ -1844,28 +2600,35 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._on_gb_clean_cap_toggled(self.gb_clean_cap.isChecked())
                     self._on_gb_clean_ind_toggled(self.gb_clean_ind.isChecked())
                     self._on_gb_clean_pn_toggled(self.gb_clean_pn.isChecked())
-            if hasattr(self, "chk_overlap") and hasattr(self, "spin_overlap_mm"):
-                self.chk_overlap.blockSignals(True)
-                self.spin_overlap_mm.blockSignals(True)
-                self.chk_overlap.setChecked(s.value("report/check_overlap", False, type=bool))
-                ov = s.value("report/overlap_mm", 3.0)
-                self.spin_overlap_mm.setValue(float(ov) if ov is not None else 3.0)
-                self.spin_overlap_mm.setEnabled(self.chk_overlap.isChecked())
-                self.spin_overlap_mm.blockSignals(False)
-                self.chk_overlap.blockSignals(False)
-            units = s.value("pnp/units", "mm", str)
-            if units == "mils" and hasattr(self, "pnp_units_mils"):
-                self.pnp_units_mils.setChecked(True)
-            elif hasattr(self, "pnp_units_mm"):
-                self.pnp_units_mm.setChecked(True)
-            bom = s.value("files/last_bom", "", str)
-            pnp = s.value("files/last_pnp", "", str)
-            if bom and os.path.isfile(bom):
-                self._load_bom(bom)
-            if pnp and os.path.isfile(pnp):
-                self._load_pnp(pnp)
-        finally:
-            self._restoring_settings = False
+        if hasattr(self, "chk_critical"):
+            self.chk_critical.setChecked(s.value("report/show_critical", True, type=bool))
+            self.chk_warning.setChecked(s.value("report/show_warning", True, type=bool))
+            self.chk_info.setChecked(s.value("report/show_info", True, type=bool))
+        if hasattr(self, "chk_overlap") and hasattr(self, "spin_overlap_mm"):
+            self.chk_overlap.blockSignals(True)
+            self.spin_overlap_mm.blockSignals(True)
+            self.chk_overlap.setChecked(s.value("report/check_overlap", False, type=bool))
+            ov = s.value("report/overlap_mm", 3.0)
+            self.spin_overlap_mm.setValue(float(ov) if ov is not None else 3.0)
+            self.spin_overlap_mm.setEnabled(self.chk_overlap.isChecked())
+            self.spin_overlap_mm.blockSignals(False)
+            self.chk_overlap.blockSignals(False)
+        units = s.value("pnp/units", "mm", str)
+        if units == "mils" and hasattr(self, "pnp_units_mils"):
+            self.pnp_units_mils.setChecked(True)
+        elif hasattr(self, "pnp_units_mm"):
+            self.pnp_units_mm.setChecked(True)
+        lang_raw = s.value("ui/language", "en")
+        lang = str(lang_raw) if lang_raw is not None else "en"
+        if lang not in ("en", "ru"):
+            lang = "en"
+        if hasattr(self, "lang_combo"):
+            self.lang_combo.blockSignals(True)
+            li = self.lang_combo.findData(lang)
+            if li >= 0:
+                self.lang_combo.setCurrentIndex(li)
+            self.lang_combo.blockSignals(False)
+        self._apply_ui_language(lang, save=False)
 
     def _save_report_overlap_settings(self) -> None:
         if self._restoring_settings or not hasattr(self, "_settings"):
@@ -1874,27 +2637,146 @@ class MainWindow(QtWidgets.QMainWindow):
         s.setValue("report/check_overlap", self.chk_overlap.isChecked())
         s.setValue("report/overlap_mm", float(self.spin_overlap_mm.value()))
 
-    def _save_last_file_paths(self) -> None:
-        if self._restoring_settings or not hasattr(self, "_settings"):
+    def _on_bom_first_last_row_changed(self, *_args) -> None:
+        self._refresh_active_row_highlight("bom")
+        self._schedule_save_bom_tab_settings()
+
+    def _on_pnp_first_last_row_changed(self, *_args) -> None:
+        self._refresh_active_row_highlight("pnp")
+        self._schedule_save_pnp_tab_settings()
+
+    def _schedule_save_bom_tab_settings(self) -> None:
+        if self._bom_ui_restoring or self._restoring_settings:
             return
-        s = self._settings
-        bom = self.bom_path_label.text()
-        pnp = self.pnp_path_label.text()
-        if bom and not bom.startswith("<") and os.path.isfile(bom):
-            s.setValue("files/last_bom", bom)
-        else:
-            s.remove("files/last_bom")
-        if pnp and not pnp.startswith("<") and os.path.isfile(pnp):
-            s.setValue("files/last_pnp", pnp)
-        else:
-            s.remove("files/last_pnp")
+        self._bom_tab_settings_timer.start(400)
+
+    def _schedule_save_pnp_tab_settings(self) -> None:
+        if self._pnp_ui_restoring or self._restoring_settings:
+            return
+        self._pnp_tab_settings_timer.start(400)
+
+    @staticmethod
+    def _qsettings_bool(value: Any, default: bool = True) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        return bool(value)
+
+    def _save_bom_tab_settings_to_disk(self) -> None:
+        if self._bom_ui_restoring or self._restoring_settings:
+            return
+        path = self._bom_source_path
+        if not path or not os.path.isfile(path):
+            return
+        h = path_settings_hash(path)
+        self._settings.beginGroup(f"bom/ui/{h}")
+        self._settings.setValue("separator", self.bom_separator.currentText())
+        self._settings.setValue("first_row", self.bom_first_row.text())
+        self._settings.setValue("last_row", self.bom_last_row.text())
+        if hasattr(self, "bom_col_combos") and self.bom_col_combos:
+            self._settings.setValue("mappings", [c.currentText() for c in self.bom_col_combos])
+        self._settings.endGroup()
+
+    def _save_pnp_tab_settings_to_disk(self) -> None:
+        if self._pnp_ui_restoring or self._restoring_settings:
+            return
+        path = self._pnp_source_path
+        if not path or not os.path.isfile(path):
+            return
+        h = path_settings_hash(path)
+        self._settings.beginGroup(f"pnp/ui/{h}")
+        self._settings.setValue("separator", self.pnp_separator.currentText())
+        self._settings.setValue("first_row", self.pnp_first_row.text())
+        self._settings.setValue("last_row", self.pnp_last_row.text())
+        if hasattr(self, "pnp_col_combos") and self.pnp_col_combos:
+            self._settings.setValue("mappings", [c.currentText() for c in self.pnp_col_combos])
+        self._settings.endGroup()
+
+    def _restore_bom_tab_load_params(self, path: str) -> None:
+        if not path or not os.path.isfile(path):
+            return
+        h = path_settings_hash(path)
+        self._settings.beginGroup(f"bom/ui/{h}")
+        try:
+            if not self._settings.contains("separator"):
+                return
+            self._bom_ui_restoring = True
+            sep = self._settings.value("separator", "auto")
+            if isinstance(sep, str) and self.bom_separator.findText(sep) >= 0:
+                self.bom_separator.setCurrentText(sep)
+            elif isinstance(sep, str):
+                idx = self.bom_separator.findText(sep)
+                if idx >= 0:
+                    self.bom_separator.setCurrentIndex(idx)
+            self.bom_first_row.setText(str(self._settings.value("first_row", "1")))
+            self.bom_last_row.setText(str(self._settings.value("last_row", "")))
+        finally:
+            self._bom_ui_restoring = False
+            self._settings.endGroup()
+
+    def _restore_pnp_tab_load_params(self, path: str) -> None:
+        if not path or not os.path.isfile(path):
+            return
+        h = path_settings_hash(path)
+        self._settings.beginGroup(f"pnp/ui/{h}")
+        try:
+            if not self._settings.contains("separator"):
+                return
+            self._pnp_ui_restoring = True
+            sep = self._settings.value("separator", "auto")
+            if isinstance(sep, str) and self.pnp_separator.findText(sep) >= 0:
+                self.pnp_separator.setCurrentText(sep)
+            self.pnp_first_row.setText(str(self._settings.value("first_row", "1")))
+            self.pnp_last_row.setText(str(self._settings.value("last_row", "")))
+        finally:
+            self._pnp_ui_restoring = False
+            self._settings.endGroup()
+
+    def _restore_bom_mappings_after_fill(self, path: str) -> None:
+        if not path or not hasattr(self, "bom_col_combos") or not self.bom_col_combos:
+            return
+        h = path_settings_hash(path)
+        self._settings.beginGroup(f"bom/ui/{h}")
+        mappings = self._settings.value("mappings", [])
+        self._settings.endGroup()
+        if not isinstance(mappings, list) or len(mappings) != len(self.bom_col_combos):
+            return
+        self._bom_ui_restoring = True
+        try:
+            for i, m in enumerate(mappings):
+                txt = str(m)
+                if self.bom_col_combos[i].findText(txt) >= 0:
+                    self.bom_col_combos[i].setCurrentText(txt)
+        finally:
+            self._bom_ui_restoring = False
+
+    def _restore_pnp_mappings_after_fill(self, path: str) -> None:
+        if not path or not hasattr(self, "pnp_col_combos") or not self.pnp_col_combos:
+            return
+        h = path_settings_hash(path)
+        self._settings.beginGroup(f"pnp/ui/{h}")
+        mappings = self._settings.value("mappings", [])
+        self._settings.endGroup()
+        if not isinstance(mappings, list) or len(mappings) != len(self.pnp_col_combos):
+            return
+        self._pnp_ui_restoring = True
+        try:
+            for i, m in enumerate(mappings):
+                txt = str(m)
+                if self.pnp_col_combos[i].findText(txt) >= 0:
+                    self.pnp_col_combos[i].setCurrentText(txt)
+        finally:
+            self._pnp_ui_restoring = False
 
     # =========================================================================
     # Column selectors - fill and handlers
     # =========================================================================
     
     def _fill_bom_combos(self):
-        """Создать dropdowns над колонками для BOM"""
+        """Create per-column role dropdowns above the BOM table."""
         if self._bom_df is None:
             return
         
@@ -1914,6 +2796,7 @@ class MainWindow(QtWidgets.QMainWindow):
             combo = QtWidgets.QComboBox()
             combo.addItems(bom_options)
             combo.setMinimumWidth(60)
+            self._style_mapping_combo(combo)
             
             # Auto-detect REF or Comment
             col_name_str = str(col_name) if col_name else ""
@@ -1932,15 +2815,16 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._update_mapping_margins)
         # Sync widths after table is shown
         QtCore.QTimer.singleShot(50, self._sync_bom_all_combos_width)
+        self._apply_pending_profile_bom_mappings()
     
     def _sync_bom_combo_width(self, col_idx, new_width):
-        """Синхронизировать ширину dropdown с колонкой"""
+        """Match one BOM mapping combo width to its table column."""
         if hasattr(self, "bom_col_combos") and col_idx < len(self.bom_col_combos):
             w = new_width if new_width > 0 else self.bom_table.sizeHintForColumn(col_idx)
             self.bom_col_combos[col_idx].setFixedWidth(max(60, w))
     
     def _sync_bom_all_combos_width(self):
-        """Синхронизировать все dropdown'ы с колонками"""
+        """Resize all BOM role dropdowns to match column widths."""
         if not hasattr(self, "bom_col_combos"):
             return
         header = self.bom_table.horizontalHeader()
@@ -1953,7 +2837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_bom_mapping_strip()
     
     def _fill_pnp_combos(self):
-        """Создать dropdowns над колонками для PnP"""
+        """Create per-column role dropdowns above the PnP table."""
         if self._pnp_df is None:
             return
         
@@ -1973,6 +2857,7 @@ class MainWindow(QtWidgets.QMainWindow):
             combo = QtWidgets.QComboBox()
             combo.addItems(pnp_options)
             combo.setMinimumWidth(50)
+            self._style_mapping_combo(combo)
             
             # Auto-detect
             col_name_str = str(col_name) if col_name else ""
@@ -1989,9 +2874,9 @@ class MainWindow(QtWidgets.QMainWindow):
             elif "FOOTPRINT" in col_upper or "PATTERN" in col_upper or "PACKAGE" in col_upper:
                 combo.setCurrentText("Footprint")
             elif "COMMENT" in col_upper and "VALUE" not in col_name_str:
-                combo.setCurrentText("Comment")
+                combo.setCurrentText("-")
             elif "VALUE" in col_upper and "POS" not in col_upper:
-                combo.setCurrentText("Value")
+                combo.setCurrentText("-")
             elif "CENTER-X" in col_upper and "MID" not in col_upper:
                 combo.setCurrentText("X")
             elif "CENTER-Y" in col_upper and "MID" not in col_upper:
@@ -2013,15 +2898,16 @@ class MainWindow(QtWidgets.QMainWindow):
         
         QtCore.QTimer.singleShot(0, lambda: self._update_mapping_margins("_pnp"))
         QtCore.QTimer.singleShot(50, self._sync_pnp_all_combos_width)
+        self._apply_pending_profile_pnp_mappings()
     
     def _sync_pnp_combo_width(self, col_idx, new_width):
-        """Синхронизировать ширину dropdown с колонкой"""
+        """Match one PnP mapping combo width to its table column."""
         if hasattr(self, "pnp_col_combos") and col_idx < len(self.pnp_col_combos):
             w = new_width if new_width > 0 else self.pnp_table.sizeHintForColumn(col_idx)
             self.pnp_col_combos[col_idx].setFixedWidth(max(50, w))
     
     def _sync_pnp_all_combos_width(self):
-        """Синхронизировать все dropdown'ы с колонками"""
+        """Resize all PnP role dropdowns to match column widths."""
         if not hasattr(self, "pnp_col_combos"):
             return
         header = self.pnp_table.horizontalHeader()
@@ -2034,28 +2920,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_pnp_mapping_strip()
     
     def _on_bom_column_changed(self, text):
-        """Обработчик изменения колонки BOM (old single combo)"""
+        """Legacy single-combo BOM column handler (logging only)."""
         self._log(f"BOM cols: REF={self.bom_ref_combo.currentText() if hasattr(self, 'bom_ref_combo') else 'N/A'}, Comment={self.bom_comment_combo.currentText() if hasattr(self, 'bom_comment_combo') else 'N/A'}", "debug")
     
     def _on_pnp_column_changed(self, text):
-        """Обработчик изменения колонки PnP (old single combo)"""
+        """Legacy single-combo PnP column handler (logging only)."""
         self._log(f"PnP cols: REF={self.pnp_ref_combo.currentText() if hasattr(self, 'pnp_ref_combo') else 'N/A'}, Comment={self.pnp_comment_combo.currentText() if hasattr(self, 'pnp_comment_combo') else 'N/A'}", "debug")
     
-    def _on_bom_header_changed(self, state):
-        """Обработчик изменения чекбокса Has headers"""
-        self._log(f"BOM has headers: {bool(state)}", "debug")
-    
-    def _on_pnp_header_changed(self, state):
-        """Обработчик изменения чекбокса Has headers"""
-        self._log(f"PnP has headers: {bool(state)}", "debug")
-    
     def _on_bom_col_mapping_changed(self, col_idx, mapping):
-        """Обработчик изменения маппинга колонки BOM"""
+        """Per-column BOM role dropdown changed."""
         self._log(f"BOM col {col_idx} -> {mapping}", "debug")
-    
+        self._schedule_save_bom_tab_settings()
+
     def _on_pnp_col_mapping_changed(self, col_idx, mapping):
-        """Обработчик изменения маппинга колонки PnP"""
+        """Per-column PnP role dropdown changed."""
         self._log(f"PnP col {col_idx} -> {mapping}", "debug")
+        self._schedule_save_pnp_tab_settings()
     
     # =========================================================================
     # Header click handlers for column mapping
@@ -2111,6 +2991,91 @@ class MainWindow(QtWidgets.QMainWindow):
     # =========================================================================
     # Cross-check, merge (shared processor config)
     # =========================================================================
+
+    def _pnp_mappings_from_combos(self) -> dict[str, object]:
+        self._sync_pnp_df_from_model()
+        out: dict[str, object] = {}
+        if self._pnp_df is None or not getattr(self, "pnp_col_combos", None):
+            return out
+        colnames = list(self._pnp_df.columns)
+        for i, combo in enumerate(self.pnp_col_combos):
+            m = combo.currentText()
+            if m != "-" and i < len(colnames):
+                out[m] = colnames[i]
+        return out
+
+    def _apply_pnp_dataframe(self, df: pd.DataFrame) -> None:
+        self._loading_working_copy = True
+        self._pnp_df = df
+        self.pnp_model.update_dataframe(df)
+        self._loading_working_copy = False
+        self._refresh_active_row_highlight("pnp")
+        self._autoresize_pnp_columns()
+        self._mark_working_dirty("pnp")
+        self._refresh_pcb_preview_from_ui()
+
+    def _pnp_clean_xy_rot_columns(self) -> None:
+        self._sync_pnp_df_from_model()
+        if self._pnp_df is None or self._pnp_df.empty:
+            QtWidgets.QMessageBox.warning(self, "Clean X/Y/R", "Load a PnP table first.")
+            return
+        maps = self._pnp_mappings_from_combos()
+        xc, yc, rc = maps.get("X"), maps.get("Y"), maps.get("Rotation")
+        miss = [n for n, c in (("X", xc), ("Y", yc), ("Rotation", rc)) if not c]
+        if miss:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Clean X/Y/R",
+                "Map these PnP columns first: " + ", ".join(miss),
+            )
+            return
+        df = self._pnp_df.copy()
+        for col in (xc, yc, rc):
+            df[col] = df[col].map(lambda v: pnp_coord.clean_numeric_cell_keep_separators(v))
+        self._apply_pnp_dataframe(df)
+        self._log("PnP: cleaned X / Y / Rotation cells", "info")
+
+    def _pnp_convert_xy_mm_to_mil(self) -> None:
+        self._sync_pnp_df_from_model()
+        if self._pnp_df is None or self._pnp_df.empty:
+            QtWidgets.QMessageBox.warning(self, "MM→MIL", "Load a PnP table first.")
+            return
+        maps = self._pnp_mappings_from_combos()
+        xc, yc = maps.get("X"), maps.get("Y")
+        if not xc or not yc:
+            QtWidgets.QMessageBox.warning(self, "MM→MIL", "Map PnP columns X and Y first.")
+            return
+        df = self._pnp_df.copy()
+        n = 0
+        for i in df.index:
+            xs, ys = pnp_coord.convert_xy_mm_to_mil_row(df.at[i, xc], df.at[i, yc])
+            if xs and ys:
+                df.at[i, xc] = xs
+                df.at[i, yc] = ys
+                n += 1
+        self._apply_pnp_dataframe(df)
+        self._log(f"PnP: MM→MIL on X/Y ({n} rows)", "info")
+
+    def _pnp_convert_xy_mil_to_mm(self) -> None:
+        self._sync_pnp_df_from_model()
+        if self._pnp_df is None or self._pnp_df.empty:
+            QtWidgets.QMessageBox.warning(self, "MIL→MM", "Load a PnP table first.")
+            return
+        maps = self._pnp_mappings_from_combos()
+        xc, yc = maps.get("X"), maps.get("Y")
+        if not xc or not yc:
+            QtWidgets.QMessageBox.warning(self, "MIL→MM", "Map PnP columns X and Y first.")
+            return
+        df = self._pnp_df.copy()
+        n = 0
+        for i in df.index:
+            xs, ys = pnp_coord.convert_xy_mil_to_mm_row(df.at[i, xc], df.at[i, yc])
+            if xs and ys:
+                df.at[i, xc] = xs
+                df.at[i, yc] = ys
+                n += 1
+        self._apply_pnp_dataframe(df)
+        self._log(f"PnP: MIL→MM on X/Y ({n} rows)", "info")
 
     def _configure_processor_from_ui(self) -> Optional[SMTDataProcessor]:
         self._sync_bom_df_from_model()
@@ -2175,7 +3140,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bom_cfg = ColumnConfig(
             designator=str(bom_ref),
             comment=str(bom_comment_col),
-            has_header=self.bom_has_headers.isChecked(),
+            has_header=HIDDEN_TABLE_HAS_HEADER_ROW,
         )
         pnp_cfg = ColumnConfig(
             designator=str(pnp_ref),
@@ -2185,13 +3150,13 @@ class MainWindow(QtWidgets.QMainWindow):
             coord_y=str(pnp_y) if pnp_y else "_skip_",
             rotation=str(pnp_rot) if pnp_rot else "_skip_",
             layer=str(pnp_layer) if pnp_layer else "_skip_",
-            has_header=self.pnp_has_headers.isChecked(),
+            has_header=HIDDEN_TABLE_HAS_HEADER_ROW,
         )
 
         use_mils = self.pnp_units_mils.isChecked()
         proc = SMTDataProcessor(
             ProcessorConfig(
-                coord_unit_mils=not use_mils,
+                overlap_xy_are_mm=not use_mils,
                 min_distance_mm=float(self.spin_overlap_mm.value()),
                 check_overlap=self.chk_overlap.isChecked(),
                 progress_log=lambda m, l: self.log_message.emit(m, l),
@@ -2200,10 +3165,24 @@ class MainWindow(QtWidgets.QMainWindow):
         proc.set_dataframes(self._bom_df, self._pnp_df, bom_cfg, pnp_cfg)
         return proc
 
+    def _hide_merge_cross_check_ok_banner(self) -> None:
+        if hasattr(self, "merge_cc_ok_banner"):
+            self.merge_cc_ok_banner.setVisible(False)
+
+    def _show_merge_cross_check_ok_banner(self) -> None:
+        if hasattr(self, "merge_cc_ok_banner"):
+            self.merge_cc_ok_banner.setVisible(True)
+
     def _run_cross_check(self) -> None:
-        if self._cc_thread is not None and self._cc_thread.isRunning():
-            self._log("Cross-check already running", "warning")
-            return
+        t = self._cc_thread
+        if t is not None:
+            try:
+                if t.isRunning():
+                    self._log("Cross-check already running", "warning")
+                    return
+            except RuntimeError:
+                self._cc_thread = None
+        self._hide_merge_cross_check_ok_banner()
         self._log("Running cross-check...", "info")
         proc = self._configure_processor_from_ui()
         if not proc:
@@ -2212,48 +3191,79 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_cross_check.setEnabled(False)
         self._cc_thread = CrossCheckThread(proc, self)
         self._cc_thread.result_ready.connect(self._on_cross_check_finished)
-        self._cc_thread.finished.connect(lambda: self.btn_cross_check.setEnabled(True))
-        self._cc_thread.finished.connect(self._cc_thread.deleteLater)
+        self._cc_thread.finished.connect(self._on_cross_check_thread_finished)
         self._cc_thread.start()
+
+    def _on_cross_check_thread_finished(self) -> None:
+        """Clear reference before deleteLater so we never call methods on a deleted QThread."""
+        self.btn_cross_check.setEnabled(True)
+        t = self._cc_thread
+        self._cc_thread = None
+        if t is not None:
+            t.deleteLater()
 
     def _on_cross_check_finished(self, result: Any, err: str) -> None:
         if err:
+            self._hide_merge_cross_check_ok_banner()
             self._log(f"Cross-check error: {err}", "error")
             self._last_report_html = ""
             self.btn_copy_html.setEnabled(False)
+            self.btn_save_report_html.setEnabled(False)
             QtWidgets.QMessageBox.critical(self, "Error", err)
             return
         if result is None:
+            self._hide_merge_cross_check_ok_banner()
             return
+        cross_check_clean = bool(result.empty)
         try:
+            filtered = result
             if not self.chk_critical.isChecked():
-                result = result[result["Severity"] != "critical"]
+                filtered = filtered[filtered["Severity"] != "critical"]
             if not self.chk_warning.isChecked():
-                result = result[result["Severity"] != "warning"]
+                filtered = filtered[filtered["Severity"] != "warning"]
             if not self.chk_info.isChecked():
-                result = result[result["Severity"] != "info"]
-            self._result_df = result
-            self.result_model.update_dataframe(result)
+                filtered = filtered[filtered["Severity"] != "info"]
+            self._result_df = filtered
+            self.result_model.update_dataframe(filtered)
 
-            critical = int((result["Severity"] == "critical").sum()) if not result.empty else 0
-            warn_n = int((result["Severity"] == "warning").sum()) if not result.empty else 0
-            info_n = int((result["Severity"] == "info").sum()) if not result.empty else 0
+            critical = int((filtered["Severity"] == "critical").sum()) if not filtered.empty else 0
+            warn_n = int((filtered["Severity"] == "warning").sum()) if not filtered.empty else 0
+            info_n = int((filtered["Severity"] == "info").sum()) if not filtered.empty else 0
 
-            self._log(f"Cross-check complete: {len(result)} issues", "info")
-            self._log(f"  Critical: {critical}", "info")
-            self._log(f"  Warning: {warn_n}", "info")
-            self._log(f"  Info: {info_n}", "info")
+            if cross_check_clean:
+                self._show_merge_cross_check_ok_banner()
+                self._log(
+                    "Cross-check complete: no issues — BOM and PnP are consistent. "
+                    "Use the Merge tab to merge and export.",
+                    "info",
+                )
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Cross-check",
+                    "No issues found. BOM and PnP look consistent.\n\n"
+                    "Go to the Merge tab to run Merge and export CSV, Excel, or layer files.",
+                )
+            else:
+                self._hide_merge_cross_check_ok_banner()
+                self._log(f"Cross-check complete: {len(filtered)} issue(s) in report view", "info")
+                self._log(f"  Critical: {critical}", "info")
+                self._log(f"  Warning: {warn_n}", "info")
+                self._log(f"  Info: {info_n}", "info")
 
             bom_p = self.bom_path_label.text()
             pnp_p = self.pnp_path_label.text()
             self._last_report_html = result_dataframe_to_html(
-                result, bom_p if not bom_p.startswith("<") else "", pnp_p if not pnp_p.startswith("<") else ""
+                filtered, bom_p if not bom_p.startswith("<") else "", pnp_p if not pnp_p.startswith("<") else ""
             )
-            self.btn_copy_html.setEnabled(bool(self._last_report_html))
+            has_report = bool(self._last_report_html)
+            self.btn_copy_html.setEnabled(has_report)
+            self.btn_save_report_html.setEnabled(has_report)
         except Exception as e:
+            self._hide_merge_cross_check_ok_banner()
             self._log(f"Cross-check result handling error: {e}", "error")
             self._last_report_html = ""
             self.btn_copy_html.setEnabled(False)
+            self.btn_save_report_html.setEnabled(False)
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
 
     def _run_merge(self) -> None:
@@ -2306,6 +3316,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"PnP replaced from Merge: {len(self._pnp_df)} rows, {len(self._pnp_df.columns)} cols",
             "info",
         )
+        self._hide_merge_cross_check_ok_banner()
 
     def _merge_layer_column(self) -> Optional[str]:
         if self._last_merge_df is None:
@@ -2475,6 +3486,57 @@ class MainWindow(QtWidgets.QMainWindow):
         clip.setMimeData(mime)
         self._log("Report copied to clipboard (HTML + text)", "info")
 
+    def _save_report_html(self) -> None:
+        if not self._last_report_html:
+            self._log("No report HTML — run Cross-check first", "warning")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Save HTML report",
+                "Run Cross-check first; there is no report to save.",
+            )
+            return
+        bom_t = self.bom_path_label.text()
+        pnp_t = self.pnp_path_label.text()
+        start_dir = os.getcwd()
+        suggest = "cross_check_report.html"
+        for p in (bom_t, pnp_t):
+            if not p or p.startswith("<"):
+                continue
+            path_obj = Path(p).expanduser()
+            try:
+                resolved = path_obj.resolve()
+            except OSError:
+                continue
+            parent = resolved.parent
+            if parent.is_dir():
+                start_dir = str(parent)
+            if path_obj.is_file():
+                suggest = f"{path_obj.stem}_cross_check_report.html"
+                break
+            if path_obj.stem:
+                suggest = f"{path_obj.stem}_cross_check_report.html"
+                break
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save HTML report",
+            os.path.join(start_dir, suggest),
+            "HTML files (*.html);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".html"):
+            path += ".html"
+        try:
+            doc = html_document_from_fragment(self._last_report_html)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(doc)
+        except OSError as e:
+            self._log(f"Save HTML report failed: {e}", "error")
+            QtWidgets.QMessageBox.critical(self, "Save HTML report", str(e))
+            return
+        self._log(f"Saved HTML report: {path}", "info")
+
     def _find_replace_table(self, kind: str) -> None:
         table = self.bom_table if kind == "bom" else self.pnp_table
         model = self.bom_model if kind == "bom" else self.pnp_model
@@ -2572,6 +3634,16 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.resize(420, 180)
         dlg.exec()
 
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Persist active profile snapshot (widgets only; no BOM/PnP file paths)."""
+        try:
+            if hasattr(self, "_save_full_profile_snapshot"):
+                self._save_full_profile_snapshot()
+            if hasattr(self, "_settings"):
+                self._settings.sync()
+        finally:
+            super().closeEvent(event)
+
     # =========================================================================
     # Logging
     # =========================================================================
@@ -2597,11 +3669,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setOrganizationName(SETTINGS_ORG)
     apply_stylesheet(app, theme=LIGHT_THEME)
-    
+
     window = MainWindow()
     window.show()
-    
+
     sys.exit(app.exec())
 
 

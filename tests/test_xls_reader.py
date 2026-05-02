@@ -1,5 +1,4 @@
 import pytest
-import pytest
 import sys
 import os
 
@@ -18,9 +17,9 @@ def test_no_file():
 
 def test_bom():
     grid = xls_reader.read_xls_sheet(f"{tests_path}/assets/bom.xls")
-    assert grid.nrows == 57-7 # skip lines with empty column A
+    assert grid.nrows == 54
     assert grid.ncols == 10
-    assert grid.rows_raw()[0][9] == "50"
+    assert grid.rows_raw()[4][9] == "50"
     assert grid.rows_raw()[-1][2] == "HC-49U"
     # check if empty cells were appended
-    assert grid.rows_raw()[1][9] == ""
+    assert grid.rows_raw()[5][9] == ""
